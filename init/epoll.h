@@ -22,7 +22,9 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 #include <android-base/unique_fd.h>
@@ -36,15 +38,24 @@ class Epoll {
   public:
     Epoll();
 
+    typedef std::function<void()> Handler;
+
     Result<void> Open();
-    Result<void> RegisterHandler(int fd, std::function<void()> handler, uint32_t events = EPOLLIN);
+    Result<void> RegisterHandler(int fd, Handler handler, uint32_t events = EPOLLIN);
     Result<void> UnregisterHandler(int fd);
-    Result<std::vector<std::function<void()>*>> Wait(
-            std::optional<std::chrono::milliseconds> timeout);
+    void SetFirstCallback(std::function<void()> first_callback);
+    Result<int> Wait(std::optional<std::chrono::milliseconds> timeout);
 
   private:
+    struct Info {
+        Handler handler;
+        uint32_t events;
+    };
+
     android::base::unique_fd epoll_fd_;
-    std::map<int, std::function<void()>> epoll_handlers_;
+    std::map<int, Info> epoll_handlers_;
+    std::function<void()> first_callback_;
+    std::unordered_set<int> to_remove_;
 };
 
 }  // namespace init

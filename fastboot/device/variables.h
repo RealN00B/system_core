@@ -54,6 +54,8 @@ bool GetPartitionIsLogical(FastbootDevice* device, const std::vector<std::string
                            std::string* message);
 bool GetIsUserspace(FastbootDevice* device, const std::vector<std::string>& args,
                     std::string* message);
+bool GetIsForceDebuggable(FastbootDevice* device, const std::vector<std::string>& args,
+                          std::string* message);
 bool GetHardwareRevision(FastbootDevice* device, const std::vector<std::string>& args,
                          std::string* message);
 bool GetVariant(FastbootDevice* device, const std::vector<std::string>& args, std::string* message);
@@ -61,8 +63,14 @@ bool GetOffModeChargeState(FastbootDevice* device, const std::vector<std::string
                            std::string* message);
 bool GetBatteryVoltage(FastbootDevice* device, const std::vector<std::string>& args,
                        std::string* message);
+bool GetBatterySoC(FastbootDevice* device, const std::vector<std::string>& args,
+                   std::string* message);
 bool GetBatterySoCOk(FastbootDevice* device, const std::vector<std::string>& args,
                      std::string* message);
+bool GetBatterySerialNumber(FastbootDevice* device, const std::vector<std::string>& args,
+                            std::string* message);
+bool GetBatteryPartStatus(FastbootDevice* device, const std::vector<std::string>& args,
+                          std::string* message);
 bool GetSuperPartitionName(FastbootDevice* device, const std::vector<std::string>& args,
                            std::string* message);
 bool GetSnapshotUpdateStatus(FastbootDevice* device, const std::vector<std::string>& args,
@@ -80,6 +88,11 @@ bool GetSecurityPatchLevel(FastbootDevice* device, const std::vector<std::string
                            std::string* message);
 bool GetTrebleEnabled(FastbootDevice* device, const std::vector<std::string>& args,
                       std::string* message);
+bool GetMaxFetchSize(FastbootDevice* /* device */, const std::vector<std::string>& /* args */,
+                     std::string* message);
+
+// Complex cases.
+bool GetDmesg(FastbootDevice* device);
 
 // Helpers for getvar all.
 std::vector<std::vector<std::string>> GetAllPartitionArgsWithSlot(FastbootDevice* device);

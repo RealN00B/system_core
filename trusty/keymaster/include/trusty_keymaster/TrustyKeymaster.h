@@ -25,7 +25,7 @@ class TrustyKeymaster {
   public:
     TrustyKeymaster();
     ~TrustyKeymaster();
-    int Initialize();
+    int Initialize(KmVersion version);
     void GetVersion(const GetVersionRequest& request, GetVersionResponse* response);
     void SupportedAlgorithms(const SupportedAlgorithmsRequest& request,
                              SupportedAlgorithmsResponse* response);
@@ -42,6 +42,9 @@ class TrustyKeymaster {
     void AddRngEntropy(const AddEntropyRequest& request, AddEntropyResponse* response);
     void Configure(const ConfigureRequest& request, ConfigureResponse* response);
     void GenerateKey(const GenerateKeyRequest& request, GenerateKeyResponse* response);
+    void GenerateRkpKey(const GenerateRkpKeyRequest& request, GenerateRkpKeyResponse* response);
+    void GenerateCsr(const GenerateCsrRequest& request, GenerateCsrResponse* response);
+    void GenerateCsrV2(const GenerateCsrV2Request& request, GenerateCsrV2Response* response);
     void GetKeyCharacteristics(const GetKeyCharacteristicsRequest& request,
                                GetKeyCharacteristicsResponse* response);
     void ImportKey(const ImportKeyRequest& request, ImportKeyResponse* response);
@@ -52,6 +55,8 @@ class TrustyKeymaster {
     void UpgradeKey(const UpgradeKeyRequest& request, UpgradeKeyResponse* response);
     void DeleteKey(const DeleteKeyRequest& request, DeleteKeyResponse* response);
     void DeleteAllKeys(const DeleteAllKeysRequest& request, DeleteAllKeysResponse* response);
+    void DestroyAttestationIds(const DestroyAttestationIdsRequest& request,
+                               DestroyAttestationIdsResponse* response);
     void BeginOperation(const BeginOperationRequest& request, BeginOperationResponse* response);
     void UpdateOperation(const UpdateOperationRequest& request, UpdateOperationResponse* response);
     void FinishOperation(const FinishOperationRequest& request, FinishOperationResponse* response);
@@ -60,6 +65,14 @@ class TrustyKeymaster {
     ComputeSharedHmacResponse ComputeSharedHmac(const ComputeSharedHmacRequest& request);
     VerifyAuthorizationResponse VerifyAuthorization(const VerifyAuthorizationRequest& request);
     GetVersion2Response GetVersion2(const GetVersion2Request& request);
+    EarlyBootEndedResponse EarlyBootEnded();
+    DeviceLockedResponse DeviceLocked(const DeviceLockedRequest& request);
+    ConfigureVendorPatchlevelResponse ConfigureVendorPatchlevel(
+            const ConfigureVendorPatchlevelRequest& request);
+    GetRootOfTrustResponse GetRootOfTrust(const GetRootOfTrustRequest& request);
+    SetAdditionalAttestationInfoResponse SetAdditionalAttestationInfo(
+            const SetAdditionalAttestationInfoRequest& request);
+    GetHwInfoResponse GetHwInfo();
 
     uint32_t message_version() const { return message_version_; }
 

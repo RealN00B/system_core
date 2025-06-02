@@ -17,15 +17,16 @@
 #ifndef UTILS_LOOPER_H
 #define UTILS_LOOPER_H
 
-#include <utils/threads.h>
 #include <utils/RefBase.h>
-#include <utils/KeyedVector.h>
 #include <utils/Timers.h>
+#include <utils/Vector.h>
+#include <utils/threads.h>
 
 #include <sys/epoll.h>
 
 #include <android-base/unique_fd.h>
 
+#include <unordered_map>
 #include <utility>
 
 namespace android {
@@ -322,6 +323,12 @@ public:
     int addFd(int fd, int ident, int events, const sp<LooperCallback>& callback, void* data);
 
     /**
+     * May be useful for testing, instead of executing a looper on another thread for code expecting
+     * a looper, you can call callbacks directly.
+     */
+    bool getFdStateDebug(int fd, int* ident, int* events, sp<LooperCallback>* cb, void** data);
+
+    /**
      * Removes a previously added file descriptor from the looper.
      *
      * When this method returns, it is safe to close the file descriptor since the looper
@@ -342,6 +349,18 @@ public:
      * This method may block briefly if it needs to wake the poll.
      */
     int removeFd(int fd);
+
+    /**
+     * Tell the kernel to check for the same events we're already checking for
+     * with this FD. This is to be used when there is a kernel driver bug where
+     * the kernel does not properly mark itself as having new data available, in
+     * order to force "fd_op->poll()" to be called. You probably don't want to
+     * use this in general, and you shouldn't use it unless there is a plan to
+     * fix the kernel. See also b/296817256.
+     *
+     * Returns 1 if successfully repolled, 0 if not.
+     */
+    int repoll(int fd);
 
     /**
      * Enqueues a message to be processed by the specified handler.
@@ -421,18 +440,20 @@ public:
     static sp<Looper> getForThread();
 
 private:
-    struct Request {
-        int fd;
-        int ident;
-        int events;
-        int seq;
-        sp<LooperCallback> callback;
-        void* data;
+  using SequenceNumber = uint64_t;
 
-        void initEventItem(struct epoll_event* eventItem) const;
-    };
+  struct Request {
+      int fd;
+      int ident;
+      int events;
+      sp<LooperCallback> callback;
+      void* data;
+
+      uint32_t getEpollEvents() const;
+  };
 
     struct Response {
+        SequenceNumber seq;
         int events;
         Request request;
     };
@@ -463,9 +484,14 @@ private:
     android::base::unique_fd mEpollFd;  // guarded by mLock but only modified on the looper thread
     bool mEpollRebuildRequired; // guarded by mLock
 
-    // Locked list of file descriptor monitoring requests.
-    KeyedVector<int, Request> mRequests;  // guarded by mLock
-    int mNextRequestSeq;
+    // Locked maps of fds and sequence numbers monitoring requests.
+    // Both maps must be kept in sync at all times.
+    std::unordered_map<SequenceNumber, Request> mRequests;               // guarded by mLock
+    std::unordered_map<int /*fd*/, SequenceNumber> mSequenceNumberByFd;  // guarded by mLock
+
+    // The sequence number to use for the next fd that is added to the looper.
+    // The sequence number 0 is reserved for the WakeEventFd.
+    SequenceNumber mNextRequestSeq;  // guarded by mLock
 
     // This state is only used privately by pollOnce and does not require a lock since
     // it runs on a single thread.
@@ -474,14 +500,11 @@ private:
     nsecs_t mNextMessageUptime; // set to LLONG_MAX when none
 
     int pollInner(int timeoutMillis);
-    int removeFd(int fd, int seq);
+    int removeSequenceNumberLocked(SequenceNumber seq);  // requires mLock
     void awoken();
-    void pushResponse(int events, const Request& request);
     void rebuildEpollLocked();
     void scheduleEpollRebuildLocked();
 
-    static void initTLSKey();
-    static void threadDestructor(void *st);
     static void initEpollEvent(struct epoll_event* eventItem);
 };
 

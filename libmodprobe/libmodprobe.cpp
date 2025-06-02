@@ -17,19 +17,27 @@
 #include <modprobe/modprobe.h>
 
 #include <fnmatch.h>
+#include <grp.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 
 #include <algorithm>
+#include <map>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/parseint.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
+
+#include "exthandler/exthandler.h"
 
 std::string Modprobe::MakeCanonical(const std::string& module_path) {
     auto start = module_path.find_last_of('/');
@@ -162,6 +170,10 @@ bool Modprobe::ParseOptionsCallback(const std::vector<std::string>& args) {
     auto it = args.begin();
     const std::string& type = *it++;
 
+    if (type == "dyn_options") {
+        return ParseDynOptionsCallback(std::vector<std::string>(it, args.end()));
+    }
+
     if (type != "options") {
         LOG(ERROR) << "non-options line encountered in modules.options";
         return false;
@@ -188,6 +200,57 @@ bool Modprobe::ParseOptionsCallback(const std::vector<std::string>& args) {
     }
 
     auto [unused, inserted] = this->module_options_.emplace(canonical_name, options);
+    if (!inserted) {
+        LOG(ERROR) << "multiple options lines present for module " << module;
+        return false;
+    }
+    return true;
+}
+
+bool Modprobe::ParseDynOptionsCallback(const std::vector<std::string>& args) {
+    auto it = args.begin();
+    int arg_size = 3;
+
+    if (args.size() < arg_size) {
+        LOG(ERROR) << "dyn_options lines in modules.options must have at least" << arg_size
+                   << " entries, not " << args.size();
+        return false;
+    }
+
+    const std::string& module = *it++;
+
+    const std::string& canonical_name = MakeCanonical(module);
+    if (canonical_name.empty()) {
+        return false;
+    }
+
+    const std::string& pwnam = *it++;
+    passwd* pwd = getpwnam(pwnam.c_str());
+    if (!pwd) {
+        LOG(ERROR) << "invalid handler uid'" << pwnam << "'";
+        return false;
+    }
+
+    std::string handler_with_args =
+            android::base::Join(std::vector<std::string>(it, args.end()), ' ');
+    handler_with_args.erase(std::remove(handler_with_args.begin(), handler_with_args.end(), '\"'),
+                            handler_with_args.end());
+
+    LOG(DEBUG) << "Launching external module options handler: '" << handler_with_args
+               << " for module: " << module;
+
+    // There is no need to set envs for external module options handler - pass
+    // empty map.
+    std::unordered_map<std::string, std::string> envs_map;
+    auto result = RunExternalHandler(handler_with_args, pwd->pw_uid, 0, envs_map);
+    if (!result.ok()) {
+        LOG(ERROR) << "External module handler failed: " << result.error();
+        return false;
+    }
+
+    LOG(INFO) << "Dynamic options for module: " << module << " are '" << *result << "'";
+
+    auto [unused, inserted] = this->module_options_.emplace(canonical_name, *result);
     if (!inserted) {
         LOG(ERROR) << "multiple options lines present for module " << module;
         return false;
@@ -228,7 +291,7 @@ void Modprobe::ParseCfg(const std::string& cfg,
     }
 
     std::vector<std::string> lines = android::base::Split(cfg_contents, "\n");
-    for (const std::string line : lines) {
+    for (const auto& line : lines) {
         if (line.empty() || line[0] == '#') {
             continue;
         }
@@ -313,7 +376,9 @@ void Modprobe::ParseKernelCmdlineOptions(void) {
     }
 }
 
-Modprobe::Modprobe(const std::vector<std::string>& base_paths, const std::string load_file) {
+Modprobe::Modprobe(const std::vector<std::string>& base_paths, const std::string load_file,
+                   bool use_blocklist)
+    : blocklist_enabled(use_blocklist) {
     using namespace std::placeholders;
 
     for (const auto& base_path : base_paths) {
@@ -337,10 +402,6 @@ Modprobe::Modprobe(const std::vector<std::string>& base_paths, const std::string
     }
 
     ParseKernelCmdlineOptions();
-}
-
-void Modprobe::EnableBlocklist(bool enable) {
-    blocklist_enabled = enable;
 }
 
 std::vector<std::string> Modprobe::GetDependencies(const std::string& module) {
@@ -421,16 +482,136 @@ bool Modprobe::LoadWithAliases(const std::string& module_name, bool strict,
     }
 
     if (strict && !module_loaded) {
-        LOG(ERROR) << "LoadWithAliases was unable to load " << module_name;
+        LOG(ERROR) << "LoadWithAliases was unable to load " << module_name
+                   << ", tried: " << android::base::Join(modules_to_load, ", ");
         return false;
     }
     return true;
+}
+
+bool Modprobe::IsBlocklisted(const std::string& module_name) {
+    if (!blocklist_enabled) return false;
+
+    auto canonical_name = MakeCanonical(module_name);
+    auto dependencies = GetDependencies(canonical_name);
+    for (auto dep = dependencies.begin(); dep != dependencies.end(); ++dep) {
+        if (module_blocklist_.count(MakeCanonical(*dep))) return true;
+    }
+
+    return module_blocklist_.count(canonical_name) > 0;
+}
+
+// Another option to load kernel modules. load independent modules dependencies
+// in parallel and then update dependency list of other remaining modules,
+// repeat these steps until all modules are loaded.
+// Discard all blocklist.
+// Softdeps are taken care in InsmodWithDeps().
+bool Modprobe::LoadModulesParallel(int num_threads) {
+    bool ret = true;
+    std::map<std::string, std::vector<std::string>> mod_with_deps;
+
+    // Get dependencies
+    for (const auto& module : module_load_) {
+        // Skip blocklist modules
+        if (IsBlocklisted(module)) {
+            LOG(VERBOSE) << "LMP: Blocklist: Module " << module << " skipping...";
+            continue;
+        }
+        auto dependencies = GetDependencies(MakeCanonical(module));
+        if (dependencies.empty()) {
+            LOG(ERROR) << "LMP: Hard-dep: Module " << module
+                       << " not in .dep file";
+            return false;
+        }
+        mod_with_deps[MakeCanonical(module)] = dependencies;
+    }
+
+    while (!mod_with_deps.empty()) {
+        std::vector<std::thread> threads;
+        std::vector<std::string> mods_path_to_load;
+        std::mutex vector_lock;
+
+        // Find independent modules
+        for (const auto& [it_mod, it_dep] : mod_with_deps) {
+            auto itd_last = it_dep.rbegin();
+            if (itd_last == it_dep.rend())
+                continue;
+
+            auto cnd_last = MakeCanonical(*itd_last);
+            // Hard-dependencies cannot be blocklisted
+            if (IsBlocklisted(cnd_last)) {
+                LOG(ERROR) << "LMP: Blocklist: Module-dep " << cnd_last
+                           << " : failed to load module " << it_mod;
+                return false;
+            }
+
+            std::string str = "load_sequential=1";
+            auto it = module_options_[cnd_last].find(str);
+            if (it != std::string::npos) {
+                module_options_[cnd_last].erase(it, it + str.size());
+
+                if (!LoadWithAliases(cnd_last, true)) {
+                    return false;
+                }
+            } else {
+                if (std::find(mods_path_to_load.begin(), mods_path_to_load.end(),
+                            cnd_last) == mods_path_to_load.end()) {
+                    mods_path_to_load.emplace_back(cnd_last);
+                }
+            }
+        }
+
+        // Load independent modules in parallel
+        auto thread_function = [&] {
+            std::unique_lock lk(vector_lock);
+            while (!mods_path_to_load.empty()) {
+                auto ret_load = true;
+                auto mod_to_load = std::move(mods_path_to_load.back());
+                mods_path_to_load.pop_back();
+
+                lk.unlock();
+                ret_load &= LoadWithAliases(mod_to_load, true);
+                lk.lock();
+                if (!ret_load) {
+                    ret &= ret_load;
+                }
+            }
+        };
+
+        std::generate_n(std::back_inserter(threads), num_threads,
+                        [&] { return std::thread(thread_function); });
+
+        // Wait for the threads.
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        if (!ret) return ret;
+
+        std::lock_guard guard(module_loaded_lock_);
+        // Remove loaded module form mod_with_deps and soft dependencies of other modules
+        for (const auto& module_loaded : module_loaded_)
+            mod_with_deps.erase(module_loaded);
+
+        // Remove loaded module form dependencies of other modules which are not loaded yet
+        for (const auto& module_loaded_path : module_loaded_paths_) {
+            for (auto& [mod, deps] : mod_with_deps) {
+                auto it = std::find(deps.begin(), deps.end(), module_loaded_path);
+                if (it != deps.end()) {
+                    deps.erase(it);
+                }
+            }
+        }
+    }
+
+    return ret;
 }
 
 bool Modprobe::LoadListedModules(bool strict) {
     auto ret = true;
     for (const auto& module : module_load_) {
         if (!LoadWithAliases(module, true)) {
+            if (IsBlocklisted(module)) continue;
             ret = false;
             if (strict) break;
         }
@@ -440,16 +621,10 @@ bool Modprobe::LoadListedModules(bool strict) {
 
 bool Modprobe::Remove(const std::string& module_name) {
     auto dependencies = GetDependencies(MakeCanonical(module_name));
-    if (dependencies.empty()) {
-        LOG(ERROR) << "Empty dependencies for module " << module_name;
-        return false;
-    }
-    if (!Rmmod(dependencies[0])) {
-        return false;
-    }
-    for (auto dep = dependencies.begin() + 1; dep != dependencies.end(); ++dep) {
+    for (auto dep = dependencies.begin(); dep != dependencies.end(); ++dep) {
         Rmmod(*dep);
     }
+    Rmmod(module_name);
     return true;
 }
 
@@ -459,7 +634,7 @@ std::vector<std::string> Modprobe::ListModules(const std::string& pattern) {
         // Attempt to match both the canonical module name and the module filename.
         if (!fnmatch(pattern.c_str(), module.c_str(), 0)) {
             rv.emplace_back(module);
-        } else if (!fnmatch(pattern.c_str(), basename(deps[0].c_str()), 0)) {
+        } else if (!fnmatch(pattern.c_str(), android::base::Basename(deps[0]).c_str(), 0)) {
             rv.emplace_back(deps[0]);
         }
     }

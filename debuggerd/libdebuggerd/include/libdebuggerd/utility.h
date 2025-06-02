@@ -1,22 +1,20 @@
-/* system/debuggerd/utility.h
-**
-** Copyright 2008, The Android Open Source Project
-**
-** Licensed under the Apache License, Version 2.0 (the "License");
-** you may not use this file except in compliance with the License.
-** You may obtain a copy of the License at
-**
-**     http://www.apache.org/licenses/LICENSE-2.0
-**
-** Unless required by applicable law or agreed to in writing, software
-** distributed under the License is distributed on an "AS IS" BASIS,
-** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-** See the License for the specific language governing permissions and
-** limitations under the License.
-*/
+/*
+ * Copyright 2008, The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
-#ifndef _DEBUGGERD_UTILITY_H
-#define _DEBUGGERD_UTILITY_H
+#pragma once
 
 #include <inttypes.h>
 #include <signal.h>
@@ -53,7 +51,6 @@ enum logtype {
   HEADER,
   THREAD,
   REGISTERS,
-  FP_REGISTERS,
   BACKTRACE,
   MAPS,
   MEMORY,
@@ -75,13 +72,15 @@ void _LOG(log_t* log, logtype ltype, const char* fmt, ...) __attribute__((format
 void _VLOG(log_t* log, logtype ltype, const char* fmt, va_list ap);
 
 namespace unwindstack {
-class Unwinder;
+class AndroidUnwinder;
 class Memory;
+struct AndroidUnwinderData;
 }
 
-void log_backtrace(log_t* log, unwindstack::Unwinder* unwinder, const char* prefix);
+void log_backtrace(log_t* log, unwindstack::AndroidUnwinder* unwinder,
+                   unwindstack::AndroidUnwinderData& data, const char* prefix);
 
-ssize_t dump_memory(void* out, size_t len, size_t* start_offset, uint64_t* addr,
+ssize_t dump_memory(void* out, size_t len, uint8_t* tags, size_t tags_len, uint64_t* addr,
                     unwindstack::Memory* memory);
 void dump_memory(log_t* log, unwindstack::Memory* backtrace, uint64_t addr, const std::string&);
 
@@ -92,5 +91,3 @@ bool signal_has_si_addr(const siginfo_t*);
 void get_signal_sender(char* buf, size_t n, const siginfo_t*);
 const char* get_signame(const siginfo_t*);
 const char* get_sigcode(const siginfo_t*);
-
-#endif // _DEBUGGERD_UTILITY_H

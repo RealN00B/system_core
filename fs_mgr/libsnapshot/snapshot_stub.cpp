@@ -43,7 +43,7 @@ bool SnapshotManagerStub::FinishedSnapshotWrites(bool) {
     return false;
 }
 
-bool SnapshotManagerStub::InitiateMerge(uint64_t*) {
+bool SnapshotManagerStub::InitiateMerge() {
     LOG(ERROR) << __FUNCTION__ << " should never be called.";
     return false;
 }
@@ -121,12 +121,31 @@ bool SnapshotManagerStub::UpdateUsesCompression() {
     return false;
 }
 
+bool SnapshotManagerStub::UpdateUsesUserSnapshots() {
+    LOG(ERROR) << __FUNCTION__ << " should never be called.";
+    return false;
+}
+
 class SnapshotMergeStatsStub : public ISnapshotMergeStats {
     bool Start() override { return false; }
-    void set_state(android::snapshot::UpdateState, bool) override {}
-    void set_cow_file_size(uint64_t) override {}
+    void set_state(android::snapshot::UpdateState) override {}
     uint64_t cow_file_size() override { return 0; }
     std::unique_ptr<Result> Finish() override { return nullptr; }
+    uint64_t total_cow_size_bytes() override { return 0; }
+    uint64_t estimated_cow_size_bytes() override { return 0; }
+    void set_boot_complete_time_ms(uint32_t) override {}
+    uint32_t boot_complete_time_ms() override { return 0; }
+    void set_boot_complete_to_merge_start_time_ms(uint32_t) override {}
+    uint32_t boot_complete_to_merge_start_time_ms() override { return 0; }
+    void set_merge_failure_code(MergeFailureCode) override {}
+    MergeFailureCode merge_failure_code() override { return MergeFailureCode::Ok; }
+    void set_source_build_fingerprint(const std::string&) override {}
+    std::string source_build_fingerprint() override { return {}; }
+    bool WriteState() override { return false; }
+    SnapshotMergeReport* report() override { return &report_; }
+
+  private:
+    SnapshotMergeReport report_;
 };
 
 ISnapshotMergeStats* SnapshotManagerStub::GetSnapshotMergeStatsInstance() {
@@ -135,8 +154,8 @@ ISnapshotMergeStats* SnapshotManagerStub::GetSnapshotMergeStatsInstance() {
     return &snapshot_merge_stats;
 }
 
-std::unique_ptr<ISnapshotWriter> SnapshotManagerStub::OpenSnapshotWriter(
-        const CreateLogicalPartitionParams&, const std::optional<std::string>&) {
+std::unique_ptr<ICowWriter> SnapshotManagerStub::OpenSnapshotWriter(
+        const CreateLogicalPartitionParams&, std::optional<uint64_t>) {
     LOG(ERROR) << __FUNCTION__ << " should never be called.";
     return nullptr;
 }
@@ -149,6 +168,24 @@ bool SnapshotManagerStub::MapAllSnapshots(const std::chrono::milliseconds&) {
 bool SnapshotManagerStub::UnmapAllSnapshots() {
     LOG(ERROR) << __FUNCTION__ << " should never be called.";
     return false;
+}
+
+void SnapshotManagerStub::UpdateCowStats(ISnapshotMergeStats*) {
+    LOG(ERROR) << __FUNCTION__ << " should never be called.";
+}
+
+auto SnapshotManagerStub::ReadMergeFailureCode() -> MergeFailureCode {
+    LOG(ERROR) << __FUNCTION__ << " should never be called.";
+    return MergeFailureCode::Ok;
+}
+
+std::string SnapshotManagerStub::ReadSourceBuildFingerprint() {
+    LOG(ERROR) << __FUNCTION__ << " should never be called.";
+    return {};
+}
+
+void SnapshotManagerStub::SetMergeStatsFeatures(ISnapshotMergeStats*) {
+    LOG(ERROR) << __FUNCTION__ << " should never be called.";
 }
 
 }  // namespace android::snapshot

@@ -15,7 +15,10 @@
 // This is required because no Android.bp can include a library defined in an
 // Android.mk. Eventually should kill libfastboot (defined in Android.mk)
 package {
-    default_applicable_licenses: ["system_core_fastboot_license"],
+    default_applicable_licenses: [
+        "system_core_fastboot_license",
+        "Android-Apache-2.0",
+    ],
 }
 
 // Added automatically by a large-scale-change that took the approach of
@@ -36,10 +39,9 @@ license {
     name: "system_core_fastboot_license",
     visibility: [":__subpackages__"],
     license_kinds: [
-        "SPDX-license-identifier-Apache-2.0",
         "SPDX-license-identifier-BSD",
     ],
-    // large-scale-change unable to identify any license_text files
+    license_text: ["LICENSE"],
 }
 
 cc_library_host_static {
@@ -55,6 +57,7 @@ cc_library_host_static {
         "tcp.cpp",
         "udp.cpp",
         "util.cpp",
+        "vendor_boot_img_utils.cpp",
         "fastboot_driver.cpp",
     ],
 
@@ -75,7 +78,9 @@ cc_library_host_static {
     ],
 
     header_libs: [
+        "avb_headers",
         "bootimg_headers",
+        "libstorage_literals_headers",
     ],
 
     export_header_lib_headers: [
@@ -124,12 +129,11 @@ cc_defaults {
         "-Wextra",
         "-Werror",
         "-Wvla",
+        "-DANDROID_BASE_UNIQUE_FD_DISABLE_IMPLICIT_CONVERSION",
+        "-Wthread-safety",
     ],
     rtti: true,
 
-    clang_cflags: [
-        "-Wthread-safety",
-    ],
 }
 
 cc_binary {
@@ -138,12 +142,19 @@ cc_binary {
 
     recovery: true,
 
+    product_variables: {
+        debuggable: {
+            cppflags: ["-DFB_ENABLE_FETCH"],
+        },
+    },
+
     srcs: [
         "device/commands.cpp",
         "device/fastboot_device.cpp",
         "device/flashing.cpp",
         "device/main.cpp",
         "device/usb.cpp",
+        "device/usb_iouring.cpp",
         "device/usb_client.cpp",
         "device/tcp_client.cpp",
         "device/utility.cpp",
@@ -154,10 +165,15 @@ cc_binary {
     shared_libs: [
         "android.hardware.boot@1.0",
         "android.hardware.boot@1.1",
+        "android.hardware.boot-V1-ndk",
+        "libboot_control_client",
         "android.hardware.fastboot@1.1",
+        "android.hardware.fastboot-V1-ndk",
         "android.hardware.health@2.0",
+        "android.hardware.health-V4-ndk",
         "libasyncio",
         "libbase",
+        "libbinder_ndk",
         "libbootloader_message",
         "libcutils",
         "libext2_uuid",
@@ -170,20 +186,28 @@ cc_binary {
         "libprotobuf-cpp-lite",
         "libsparse",
         "libutils",
+        "libselinux",
     ],
 
     static_libs: [
-        "libgtest_prod",
+        "android.hardware.health-translate-ndk",
         "libhealthhalutils",
+        "libhealthshim",
+        "libfastbootshim",
         "libsnapshot_cow",
+        "liblz4",
+        "libzstd",
         "libsnapshot_nobinder",
         "update_metadata-protos",
+        "liburing",
     ],
 
     header_libs: [
         "avb_headers",
+        "libgtest_prod_headers",
         "libsnapshot_headers",
-    ]
+        "libstorage_literals_headers",
+    ],
 }
 
 cc_defaults {
@@ -196,6 +220,8 @@ cc_defaults {
         "-Wextra",
         "-Werror",
         "-Wunreachable-code",
+        "-DANDROID_BASE_UNIQUE_FD_DISABLE_IMPLICIT_CONVERSION",
+        "-D_FILE_OFFSET_BITS=64",
     ],
 
     target: {
@@ -236,6 +262,7 @@ cc_defaults {
         "libsparse",
         "libutils",
         "liblog",
+        "liblz4",
         "libz",
         "libdiagnose_usb",
         "libbase",
@@ -256,20 +283,35 @@ cc_library_host_static {
 
     srcs: [
         "bootimg_utils.cpp",
+        "fastboot_driver.cpp",
         "fastboot.cpp",
+        "filesystem.cpp",
         "fs.cpp",
         "socket.cpp",
+        "storage.cpp",
+        "super_flash_helper.cpp",
         "tcp.cpp",
         "udp.cpp",
         "util.cpp",
-        "fastboot_driver.cpp",
+        "vendor_boot_img_utils.cpp",
+        "task.cpp",
     ],
 
     // Only version the final binaries
     use_version_lib: false,
     static_libs: ["libbuildversion"],
+    header_libs: [
+        "avb_headers",
+        "libstorage_literals_headers",
+    ],
 
     generated_headers: ["platform_tools_version"],
+
+    tidy_flags: [
+        // DO NOT add quotes around header-filter flag regex argument,
+        // because build/soong will add quotes around the whole flag.
+        "-header-filter=(system/core/fastboot/|development/host/windows/usb/api/)",
+    ],
 
     target: {
         windows: {
@@ -306,6 +348,8 @@ cc_binary_host {
         targets: [
             "dist_files",
             "sdk",
+            "sdk-repo-platform-tools",
+            "sdk_repo",
             "win_sdk",
         ],
     },
@@ -313,9 +357,7 @@ cc_binary_host {
     target: {
         not_windows: {
             required: [
-                "e2fsdroid",
                 "mke2fs.conf",
-                "sload_f2fs",
             ],
         },
         windows: {
@@ -334,14 +376,20 @@ cc_test_host {
     defaults: ["fastboot_host_defaults"],
 
     srcs: [
+        "fastboot_driver_test.cpp",
         "fastboot_test.cpp",
         "socket_mock.cpp",
         "socket_test.cpp",
+        "super_flash_helper_test.cpp",
+        "task_test.cpp",
         "tcp_test.cpp",
         "udp_test.cpp",
     ],
 
-    static_libs: ["libfastboot"],
+    static_libs: [
+        "libfastboot",
+        "libgmock",
+    ],
 
     target: {
         windows: {
@@ -351,5 +399,60 @@ cc_test_host {
             // Avoid trying to build for win64
             enabled: false,
         },
+    },
+
+    test_suites: ["general-tests"],
+
+    data: [
+        "testdata/super.img",
+        "testdata/super_empty.img",
+        "testdata/system.img",
+    ],
+}
+
+cc_test_host {
+    name: "fastboot_vendor_boot_img_utils_test",
+    srcs: ["vendor_boot_img_utils_test.cpp"],
+    static_libs: [
+        "libbase",
+        "libfastboot",
+        "libgmock",
+        "liblog",
+    ],
+    header_libs: [
+        "avb_headers",
+        "bootimg_headers",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+    data: [
+        ":fastboot_test_dtb",
+        ":fastboot_test_dtb_replace",
+        ":fastboot_test_bootconfig",
+        ":fastboot_test_vendor_ramdisk_none",
+        ":fastboot_test_vendor_ramdisk_platform",
+        ":fastboot_test_vendor_ramdisk_replace",
+        ":fastboot_test_vendor_boot_v3",
+        ":fastboot_test_vendor_boot_v4_without_frag",
+        ":fastboot_test_vendor_boot_v4_with_frag",
+    ],
+}
+
+cc_library_headers {
+    name: "fastboot_headers",
+    host_supported: true,
+    export_include_dirs: ["."],
+}
+
+python_test_host {
+    name: "fastboot_integration_test",
+    main: "test_fastboot.py",
+    srcs: ["test_fastboot.py"],
+    data: [":fastboot"],
+    test_config: "fastboot_integration_test.xml",
+    test_options: {
+        unit_test: false,
     },
 }

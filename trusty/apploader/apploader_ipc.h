@@ -44,6 +44,11 @@ enum apploader_command : uint32_t {
  * @APPLOADER_ERR_ALREADY_EXISTS:       application has already been loaded
  * @APPLOADER_ERR_INTERNAL:             miscellaneous or internal apploader
  *                                      error not covered by the above
+ * @APPLOADER_ERR_INVALID_VERSION:      invalid application version
+ * @APPLOADER_ERR_POLICY_VIOLATION:     signature verification succeeded but
+ *                                      key+manifest combination not allowed
+ *                                      by app loader policy engine
+ * @APPLOADER_ERR_NOT_ENCRYPTED:        unmet application encryption requirement
  */
 enum apploader_error : uint32_t {
     APPLOADER_NO_ERROR = 0,
@@ -54,6 +59,9 @@ enum apploader_error : uint32_t {
     APPLOADER_ERR_LOADING_FAILED,
     APPLOADER_ERR_ALREADY_EXISTS,
     APPLOADER_ERR_INTERNAL,
+    APPLOADER_ERR_INVALID_VERSION,
+    APPLOADER_ERR_POLICY_VIOLATION,
+    APPLOADER_ERR_NOT_ENCRYPTED,
 };
 
 /**

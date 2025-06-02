@@ -22,10 +22,9 @@
 #include <utility>
 #include <vector>
 
-#include <android/hardware/boot/1.0/IBootControl.h>
-#include <android/hardware/boot/1.1/IBootControl.h>
-#include <android/hardware/fastboot/1.1/IFastboot.h>
-#include <android/hardware/health/2.0/IHealth.h>
+#include <BootControlClient.h>
+#include <aidl/android/hardware/fastboot/IFastboot.h>
+#include <aidl/android/hardware/health/IHealth.h>
 
 #include "commands.h"
 #include "transport.h"
@@ -33,6 +32,7 @@
 
 class FastbootDevice {
   public:
+    using BootControlClient = android::hal::BootControlClient;
     FastbootDevice();
     ~FastbootDevice();
 
@@ -40,6 +40,7 @@ class FastbootDevice {
     void ExecuteCommands();
     bool WriteStatus(FastbootResult result, const std::string& message);
     bool HandleData(bool read, std::vector<char>* data);
+    bool HandleData(bool read, char* data, uint64_t size);
     std::string GetCurrentSlot();
 
     // Shortcuts for writing status results.
@@ -49,14 +50,12 @@ class FastbootDevice {
 
     std::vector<char>& download_data() { return download_data_; }
     Transport* get_transport() { return transport_.get(); }
-    android::sp<android::hardware::boot::V1_0::IBootControl> boot_control_hal() {
-        return boot_control_hal_;
-    }
-    android::sp<android::hardware::boot::V1_1::IBootControl> boot1_1() { return boot1_1_; }
-    android::sp<android::hardware::fastboot::V1_1::IFastboot> fastboot_hal() {
+    BootControlClient* boot_control_hal() const { return boot_control_hal_.get(); }
+    BootControlClient* boot1_1() const;
+    std::shared_ptr<aidl::android::hardware::fastboot::IFastboot> fastboot_hal() {
         return fastboot_hal_;
     }
-    android::sp<android::hardware::health::V2_0::IHealth> health_hal() { return health_hal_; }
+    std::shared_ptr<aidl::android::hardware::health::IHealth> health_hal() { return health_hal_; }
 
     void set_active_slot(const std::string& active_slot) { active_slot_ = active_slot; }
 
@@ -64,10 +63,9 @@ class FastbootDevice {
     const std::unordered_map<std::string, CommandHandler> kCommandMap;
 
     std::unique_ptr<Transport> transport_;
-    android::sp<android::hardware::boot::V1_0::IBootControl> boot_control_hal_;
-    android::sp<android::hardware::boot::V1_1::IBootControl> boot1_1_;
-    android::sp<android::hardware::health::V2_0::IHealth> health_hal_;
-    android::sp<android::hardware::fastboot::V1_1::IFastboot> fastboot_hal_;
+    std::unique_ptr<BootControlClient> boot_control_hal_;
+    std::shared_ptr<aidl::android::hardware::health::IHealth> health_hal_;
+    std::shared_ptr<aidl::android::hardware::fastboot::IFastboot> fastboot_hal_;
     std::vector<char> download_data_;
     std::string active_slot_;
 };

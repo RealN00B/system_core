@@ -77,6 +77,43 @@ monolithic init .rc files.  This additionally will aid in merge
 conflict resolution when multiple services are added to the system, as
 each one will go into a separate file.
 
+Versioned RC files within APEXs
+-------------------------------
+
+With the arrival of mainline on Android Q, the individual mainline
+modules carry their own init.rc files within their boundaries. Init
+processes these files according to the naming pattern `/apex/*/etc/*rc`.
+
+Because APEX modules must run on more than one release of Android,
+they may require different parameters as part of the services they
+define. This is achieved, starting in Android T, by incorporating
+the SDK version information in the name of the init file.  The suffix
+is changed from `.rc` to `.#rc` where # is the first SDK where that
+RC file is accepted. An init file specific to SDK=31 might be named
+`init.31rc`. With this scheme, an APEX may include multiple init files. An
+example is appropriate.
+
+For an APEX module with the following files in /apex/sample-module/apex/etc/:
+
+   1. init.rc
+   2. init.32rc
+   4. init.35rc
+
+The selection rule chooses the highest `.#rc` value that does not
+exceed the SDK of the currently running system. The unadorned `.rc`
+is interpreted as sdk=0.
+
+When this APEX is installed on a device with SDK <=31, the system will
+process init.rc.  When installed on a device running SDK 32, 33, or 34,
+it will use init.32rc.  When installed on a device running SDKs >= 35,
+it will choose init.35rc
+
+This versioning scheme is used only for the init files within APEX
+modules; it does not apply to the init files stored in /system/etc/init,
+/vendor/etc/init, or other directories.
+
+This naming scheme is available after Android S.
+
 Actions
 -------
 Actions are named sequences of commands.  Actions have a trigger which
@@ -125,6 +162,28 @@ equals `true`, then the order of the commands executed will be:
     setprop e 1
     setprop f 2
 
+If the property `true` wasn't `true` when the `boot` was triggered, then the
+order of the commands executed will be:
+
+    setprop a 1
+    setprop b 2
+    setprop e 1
+    setprop f 2
+
+If the property `true` becomes `true` *AFTER* `boot` was triggered, nothing will
+be executed. The condition `boot && property:true=true` will be evaluated to
+false because the `boot` trigger is a past event.
+
+Note that when `ro.property_service.async_persist_writes` is `true`, there is no
+defined ordering between persistent setprops and non-persistent setprops. For
+example:
+
+    on boot
+        setprop a 1
+        setprop persist.b 2
+
+When `ro.property_service.async_persist_writes` is `true`, triggers for these
+two properties may execute in any order.
 
 Services
 --------
@@ -147,8 +206,10 @@ runs the service.
   capability without the "CAP\_" prefix, like "NET\_ADMIN" or "SETPCAP". See
   http://man7.org/linux/man-pages/man7/capabilities.7.html for a list of Linux
   capabilities.
-  If no capabilities are provided, then all capabilities are removed from this service, even if it
-  runs as root.
+  If no capabilities are provided, then behaviour depends on the user the service runs under:
+    * if it's root, then the service will run with all the capabitilies (note: whether the
+        service can actually use them is controlled by selinux);
+    * otherwise all capabilities will be dropped.
 
 `class <name> [ <name>\* ]`
 > Specify class names for the service.  All services in a
@@ -193,6 +254,10 @@ runs the service.
 > Open a file path and pass its fd to the launched process. _type_ must be
   "r", "w" or "rw".  For native executables see libcutils
   android\_get\_control\_file().
+
+`gentle_kill`
+> This service will be sent SIGTERM instead of SIGKILL when stopped. After a 200 ms timeout, it will
+  be sent SIGKILL.
 
 `group <groupname> [ <groupname>\* ]`
 > Change to 'groupname' before exec'ing this service.  Additional
@@ -279,11 +344,14 @@ runs the service.
   intended to be used with the `exec_start` builtin for any must-have checks during boot.
 
 `restart_period <seconds>`
-> If a non-oneshot service exits, it will be restarted at its start time plus
-  this period. It defaults to 5s to rate limit crashing services.
-  This can be increased for services that are meant to run periodically. For
-  example, it may be set to 3600 to indicate that the service should run every hour
-  or 86400 to indicate that the service should run every day.
+> If a non-oneshot service exits, it will be restarted at its previous start time plus this period.
+  The default value is 5s. This can be used to implement periodic services together with the
+  `timeout_period` command below. For example, it may be set to 3600 to indicate that the service
+  should run every hour or 86400 to indicate that the service should run every day. This can be set
+  to a value shorter than 5s for example 0, but the minimum 5s delay is enforced if the restart was
+  due to a crash. This is to rate limit persistentally crashing services. In other words,
+  `<seconds>` smaller than 5 is respected only when the service exits deliverately and successfully
+  (i.e. by calling exit(0)).
 
 `rlimit <resource> <cur> <max>`
 > This applies the given rlimit to the service. rlimits are inherited by child
@@ -315,9 +383,10 @@ runs the service.
 
 `socket <name> <type> <perm> [ <user> [ <group> [ <seclabel> ] ] ]`
 > Create a UNIX domain socket named /dev/socket/_name_ and pass its fd to the
-  launched process.  _type_ must be "dgram", "stream" or "seqpacket".  _type_
-  may end with "+passcred" to enable SO_PASSCRED on the socket. User and
-  group default to 0.  'seclabel' is the SELinux security context for the
+  launched process.  The socket is created synchronously when the service starts.
+  _type_ must be "dgram", "stream" or "seqpacket".  _type_ may end with "+passcred"
+  to enable SO_PASSCRED on the socket or "+listen" to synchronously make it a listening socket.
+  User and group default to 0.  'seclabel' is the SELinux security context for the
   socket.  It defaults to the service security context, as specified by
   seclabel or computed based on the service executable file security context.
   For native executables see libcutils android\_get\_control\_socket().
@@ -330,8 +399,9 @@ runs the service.
   given console.
 
 `task_profiles <profile> [ <profile>\* ]`
-> Set task profiles for the process when it forks. This is designed to replace the use of
-  writepid option for moving a process into a cgroup.
+> Set task profiles. Before Android U, the profiles are applied to the main thread of the service.
+  For Android U and later, the profiles are applied to the entire service process. This is designed
+  to replace the use of writepid option for moving a process into a cgroup.
 
 `timeout_period <seconds>`
 > Provide a timeout after which point the service will be killed. The oneshot keyword is respected
@@ -360,7 +430,7 @@ runs the service.
   using this new mechanism, processes can use the user option to
   select their desired uid without ever running as root.
   As of Android O, processes can also request capabilities directly in their .rc
-  files. See the "capabilities" option below.
+  files. See the "capabilities" option above.
 
 `writepid <file> [ <file>\* ]`
 > Write the child's pid to the given files when it forks. Meant for
@@ -394,7 +464,9 @@ event trigger.
 
 For example:
 `on boot && property:a=b` defines an action that is only executed when
-the 'boot' event trigger happens and the property a equals b.
+the 'boot' event trigger happens and the property a equals b at the moment. This
+will NOT be executed when the property a transitions to value b after the `boot`
+event was triggered.
 
 `on property:a=b && property:c=d` defines an action that is executed
 at three times:
@@ -403,6 +475,36 @@ at three times:
    2. Any time that property a transitions to value b, while property c already equals d.
    3. Any time that property c transitions to value d, while property a already equals b.
 
+
+Trigger Sequence
+----------------
+
+Init uses the following sequence of triggers during early boot. These are the
+built-in triggers defined in init.cpp.
+
+   1. `early-init` - The first in the sequence, triggered after cgroups has been configured
+      but before ueventd's coldboot is complete.
+   2. `init` - Triggered after coldboot is complete.
+   3. `charger` - Triggered if `ro.bootmode == "charger"`.
+   4. `late-init` - Triggered if `ro.bootmode != "charger"`, or via healthd triggering a boot
+      from charging mode.
+
+Remaining triggers are configured in `init.rc` and are not built-in. The default sequence for
+these is specified under the "on late-init" event in `init.rc`. Actions internal to `init.rc`
+have been omitted.
+
+   1. `early-fs` - Start vold.
+   2. `fs` - Vold is up. Mount partitions not marked as first-stage or latemounted.
+   3. `post-fs` - Configure anything dependent on early mounts.
+   4. `late-fs` - Mount partitions marked as latemounted.
+   5. `post-fs-data` - Mount and configure `/data`; set up encryption. `/metadata` is
+      reformatted here if it couldn't mount in first-stage init.
+   6. `post-fs-data-checkpointed` - Triggered when vold has completed committing a checkpoint
+      after an OTA update. Not triggered if checkpointing is not needed or supported.
+   7. `bpf-progs-loaded` - Starts things that want to start ASAP but need eBPF (incl. netd)
+   8. `zygote-start` - Start the zygote.
+   9. `early-boot` - After zygote has started.
+  10. `boot` - After `early-boot` actions have completed.
 
 Commands
 --------
@@ -423,11 +525,6 @@ Commands
   not already running.  See the start entry for more information on
   starting services.
 
-`class_start_post_data <serviceclass>`
-> Like `class_start`, but only considers services that were started
-  after /data was mounted, and that were running at the time
- `class_reset_post_data` was called. Only used for FDE devices.
-
 `class_stop <serviceclass>`
 > Stop and disable all services of the specified class if they are
   currently running.
@@ -437,12 +534,9 @@ Commands
   currently running, without disabling them. They can be restarted
   later using `class_start`.
 
-`class_reset_post_data <serviceclass>`
-> Like `class_reset`, but only considers services that were started
-  after /data was mounted. Only used for FDE devices.
-
-`class_restart <serviceclass>`
-> Restarts all services of the specified class.
+`class_restart [--only-enabled] <serviceclass>`
+> Restarts all services of the specified class. If `--only-enabled` is
+  specified, then disabled services are skipped.
 
 `copy <src> <dst>`
 > Copies a file. Similar to write, but useful for binary/large
@@ -523,6 +617,11 @@ instance. \
 `interface_start aidl/aidl_lazy_test_1` will start the AIDL service that
 provides the `aidl_lazy_test_1` interface.
 
+`load_exports <path>`
+> Open the file at _path_ and export global environment variables declared
+  there. Each line must be in the format `export <name> <value>`, as described
+  above.
+
 `load_system_props`
 > (This action is deprecated and no-op.)
 
@@ -538,25 +637,28 @@ provides the `aidl_lazy_test_1` interface.
   Properties are expanded within _level_.
 
 `mark_post_data`
-> Used to mark the point right after /data is mounted. Used to implement the
-  `class_reset_post_data` and `class_start_post_data` commands.
+> (This action is deprecated and no-op.)
 
 `mkdir <path> [<mode>] [<owner>] [<group>] [encryption=<action>] [key=<key>]`
 > Create a directory at _path_, optionally with the given mode, owner, and
   group. If not provided, the directory is created with permissions 755 and
   owned by the root user and root group. If provided, the mode, owner and group
   will be updated if the directory exists already.
-
- > _action_ can be one of:
-  * `None`: take no encryption action; directory will be encrypted if parent is.
-  * `Require`: encrypt directory, abort boot process if encryption fails
-  * `Attempt`: try to set an encryption policy, but continue if it fails
-  * `DeleteIfNecessary`: recursively delete directory if necessary to set
-  encryption policy.
-
-  > _key_ can be one of:
-  * `ref`: use the systemwide DE key
-  * `per_boot_ref`: use the key freshly generated on each boot.
+  If the directory does not exist, it will receive the security context from
+  the current SELinux policy or its parent if not specified in the policy. If
+  the directory exists, its security context will not be changed (even if
+  different from the policy).
+>
+> _action_ can be one of:
+>  * `None`: take no encryption action; directory will be encrypted if parent is.
+>  * `Require`: encrypt directory, abort boot process if encryption fails
+>  * `Attempt`: try to set an encryption policy, but continue if it fails
+>  * `DeleteIfNecessary`: recursively delete directory if necessary to set
+>  encryption policy.
+>
+> _key_ can be one of:
+>  * `ref`: use the systemwide DE key
+>  * `per_boot_ref`: use the key freshly generated on each boot.
 
 `mount_all [ <fstab> ] [--<option>]`
 > Calls fs\_mgr\_mount\_all on the given fs\_mgr-format fstab with optional
@@ -575,15 +677,17 @@ provides the `aidl_lazy_test_1` interface.
   _options_ include "barrier=1", "noauto\_da\_alloc", "discard", ... as
   a comma separated string, e.g. barrier=1,noauto\_da\_alloc
 
-`perform_apex_config`
+`perform_apex_config [--bootstrap]`
 > Performs tasks after APEXes are mounted. For example, creates data directories
   for the mounted APEXes, parses config file(s) from them, and updates linker
   configurations. Intended to be used only once when apexd notifies the mount
   event by setting `apexd.status` to ready.
+  Use --bootstrap when invoking in the bootstrap mount namespace.
 
-`restart <service>`
+`restart [--only-if-running] <service>`
 > Stops and restarts a running service, does nothing if the service is currently
-  restarting, otherwise, it just starts the service.
+  restarting, otherwise, it just starts the service. If "--only-if-running" is
+  specified, the service is only restarted if it is already running.
 
 `restorecon <path> [ <path>\* ]`
 > Restore the file named by _path_ to the security context specified
@@ -642,6 +746,9 @@ provides the `aidl_lazy_test_1` interface.
   fstab.${ro.hardware} or fstab.${ro.hardware.platform} will be scanned for
   under /odm/etc, /vendor/etc, or / at runtime, in that order.
 
+`swapoff <path>`
+> Stops swapping to the file or block device specified by path.
+
 `symlink <target> <path>`
 > Create a symbolic link at _path_ with the value _target_
 
@@ -661,10 +768,13 @@ provides the `aidl_lazy_test_1` interface.
   fstab.${ro.hardware} or fstab.${ro.hardware.platform} will be scanned for
   under /odm/etc, /vendor/etc, or / at runtime, in that order.
 
-`verity_update_state <mount-point>`
+`verity_update_state`
 > Internal implementation detail used to update dm-verity state and
   set the partition._mount-point_.verified properties used by adb remount
-  because fs\_mgr can't set them directly itself.
+  because fs\_mgr can't set them directly itself. This is required since
+  Android 12, because CtsNativeVerifiedBootTestCases will read property
+  "partition.${partition}.verified.hash_alg" to check that sha1 is not used.
+  See https://r.android.com/1546980 for more details.
 
 `wait <path> [ <timeout> ]`
 > Poll for the existence of the given file and return when found,
@@ -681,7 +791,6 @@ provides the `aidl_lazy_test_1` interface.
 > Open the file at _path_ and write a string to it with write(2).
   If the file does not exist, it will be created. If it does exist,
   it will be truncated. Properties are expanded within _content_.
-
 
 Imports
 -------
@@ -740,13 +849,18 @@ Init provides state information with the following properties.
 `init.svc.<name>`
 > State of a named service ("stopped", "stopping", "running", "restarting")
 
-`dev.mnt.blk.<mount_point>`
+`dev.mnt.dev.<mount_point>`, `dev.mnt.blk.<mount_point>`, `dev.mnt.rootdisk.<mount_point>`
 > Block device base name associated with a *mount_point*.
   The *mount_point* has / replaced by . and if referencing the root mount point
-  "/", it will use "/root", specifically `dev.mnt.blk.root`.
-  Meant for references to `/sys/device/block/${dev.mnt.blk.<mount_point>}/` and
-  `/sys/fs/ext4/${dev.mnt.blk.<mount_point>}/` to tune the block device
-  characteristics in a device agnostic manner.
+  "/", it will use "/root".
+  `dev.mnt.dev.<mount_point>` indicates a block device attached to filesystems.
+    (e.g., dm-N or sdaN/mmcblk0pN to access `/sys/fs/ext4/${dev.mnt.dev.<mount_point>}/`)
+
+  `dev.mnt.blk.<mount_point>` indicates the disk partition to the above block device.
+    (e.g., sdaN / mmcblk0pN to access `/sys/class/block/${dev.mnt.blk.<mount_point>}/`)
+
+  `dev.mnt.rootdisk.<mount_point>` indicates the root disk to contain the above disk partition.
+    (e.g., sda / mmcblk0 to access `/sys/class/block/${dev.mnt.rootdisk.<mount_point>}/queue`)
 
 Init responds to properties that begin with `ctl.`.  These properties take the format of
 `ctl.[<target>_]<command>` and the _value_ of the system property is used as a parameter.  The
@@ -794,6 +908,9 @@ Init records some boot timing information in system properties.
 
 `ro.boottime.init.selinux`
 > How long in ns it took to run SELinux stage.
+
+`ro.boottime.init.modules`
+> How long in ms it took to load kernel modules.
 
 `ro.boottime.init.cold_boot_wait`
 > How long init waited for ueventd's coldboot phase to end.
@@ -967,7 +1084,7 @@ located at /init within the recovery ramdisk. These devices first switch root to
 /first_stage_ramdisk to remove the recovery components from the environment, then proceed the same
 as 2). Note that the decision to boot normally into Android instead of booting
 into recovery mode is made if androidboot.force_normal_boot=1 is present in the
-kernel commandline.
+kernel commandline, or in bootconfig with Android S and later.
 
 Once first stage init finishes it execs /system/bin/init with the "selinux_setup" argument. This
 phase is where SELinux is optionally compiled and loaded onto the system. selinux.cpp contains more

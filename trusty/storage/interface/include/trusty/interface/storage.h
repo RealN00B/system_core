@@ -53,6 +53,8 @@ enum storage_cmd {
 
 	/* transaction support */
 	STORAGE_END_TRANSACTION = 9 << STORAGE_REQ_SHIFT,
+
+	STORAGE_FILE_GET_MAX_SIZE = 12 << STORAGE_REQ_SHIFT,
 };
 
 /**
@@ -70,6 +72,9 @@ enum storage_cmd {
  * @STORAGE_ERR_TRANSACT        returned by various operations to indicate that current transaction
  *                              is in error state. Such state could be only cleared by sending
  *                              STORAGE_END_TRANSACTION message.
+ * @STORAGE_ERR_SYNC_FAILURE    indicates that the current operation failed to sync
+ *                              to disk. Only returned if STORAGE_MSG_FLAG_PRE_COMMIT or
+ *                              STORAGE_MSG_FLAG_POST_COMMIT was set for the request.
  */
 enum storage_err {
 	STORAGE_NO_ERROR          = 0,
@@ -80,6 +85,7 @@ enum storage_err {
 	STORAGE_ERR_NOT_FOUND     = 5,
 	STORAGE_ERR_EXIST         = 6,
 	STORAGE_ERR_TRANSACT      = 7,
+	STORAGE_ERR_SYNC_FAILURE  = 8,
 };
 
 /**
@@ -112,26 +118,30 @@ enum storage_file_open_flag {
 
 /**
  * enum storage_msg_flag - protocol-level flags in struct storage_msg
- * @STORAGE_MSG_FLAG_BATCH:             if set, command belongs to a batch transaction.
- *                                      No response will be sent by the server until
- *                                      it receives a command with this flag unset, at
- *                                      which point a cummulative result for all messages
- *                                      sent with STORAGE_MSG_FLAG_BATCH will be sent.
- *                                      This is only supported by the non-secure disk proxy
- *                                      server.
- * @STORAGE_MSG_FLAG_PRE_COMMIT:        if set, indicates that server need to commit
- *                                      pending changes before processing this message.
- * @STORAGE_MSG_FLAG_POST_COMMIT:       if set, indicates that server need to commit
- *                                      pending changes after processing this message.
- * @STORAGE_MSG_FLAG_TRANSACT_COMPLETE: if set, indicates that server need to commit
- *                                      current transaction after processing this message.
- *                                      It is an alias for STORAGE_MSG_FLAG_POST_COMMIT.
+ * @STORAGE_MSG_FLAG_BATCH:                 if set, command belongs to a batch transaction.
+ *                                          No response will be sent by the server until
+ *                                          it receives a command with this flag unset, at
+ *                                          which point a cumulative result for all messages
+ *                                          sent with STORAGE_MSG_FLAG_BATCH will be sent.
+ *                                          This is only supported by the non-secure disk proxy
+ *                                          server.
+ * @STORAGE_MSG_FLAG_PRE_COMMIT:            if set, indicates that server need to commit
+ *                                          pending changes before processing this message.
+ * @STORAGE_MSG_FLAG_POST_COMMIT:           if set, indicates that server need to commit
+ *                                          pending changes after processing this message.
+ * @STORAGE_MSG_FLAG_TRANSACT_COMPLETE:     if set, indicates that server need to commit
+ *                                          current transaction after processing this message.
+ *                                          It is an alias for STORAGE_MSG_FLAG_POST_COMMIT.
+ * @STORAGE_MSG_FLAG_PRE_COMMIT_CHECKPOINT: if set, indicates that server needs to ensure
+ *                                          that there is not a pending checkpoint for
+ *                                          userdata before processing this message.
  */
 enum storage_msg_flag {
-	STORAGE_MSG_FLAG_BATCH = 0x1,
-	STORAGE_MSG_FLAG_PRE_COMMIT = 0x2,
-	STORAGE_MSG_FLAG_POST_COMMIT = 0x4,
-	STORAGE_MSG_FLAG_TRANSACT_COMPLETE = STORAGE_MSG_FLAG_POST_COMMIT,
+    STORAGE_MSG_FLAG_BATCH = 0x1,
+    STORAGE_MSG_FLAG_PRE_COMMIT = 0x2,
+    STORAGE_MSG_FLAG_POST_COMMIT = 0x4,
+    STORAGE_MSG_FLAG_TRANSACT_COMPLETE = STORAGE_MSG_FLAG_POST_COMMIT,
+    STORAGE_MSG_FLAG_PRE_COMMIT_CHECKPOINT = 0x8,
 };
 
 /*
@@ -173,6 +183,24 @@ struct storage_file_open_resp {
  */
 struct storage_file_close_req {
 	uint32_t handle;
+};
+
+/**
+ * struct storage_file_get_max_size_req - request format for
+ *                                        STORAGE_FILE_GET_MAX_SIZE
+ * @handle: the handle for the file whose max size is requested
+ */
+struct storage_file_get_max_size_req {
+	uint32_t handle;
+};
+
+/**
+ * struct storage_file_get_max_size_resp - response format for
+ *                                         STORAGE_FILE_GET_MAX_SIZE
+ * @max_size:   the maximum size of the file
+ */
+struct storage_file_get_max_size_resp {
+	uint64_t max_size;
 };
 
 /**

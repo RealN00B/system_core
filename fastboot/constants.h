@@ -35,13 +35,14 @@
 #define FB_CMD_OEM "oem"
 #define FB_CMD_GSI "gsi"
 #define FB_CMD_SNAPSHOT_UPDATE "snapshot-update"
+#define FB_CMD_FETCH "fetch"
 
 #define RESPONSE_OKAY "OKAY"
 #define RESPONSE_FAIL "FAIL"
 #define RESPONSE_DATA "DATA"
 #define RESPONSE_INFO "INFO"
 
-#define FB_COMMAND_SZ 64
+#define FB_COMMAND_SZ 4096
 #define FB_RESPONSE_SZ 256
 
 #define FB_VAR_VERSION "version"
@@ -63,10 +64,12 @@
 #define FB_VAR_SLOT_UNBOOTABLE "slot-unbootable"
 #define FB_VAR_IS_LOGICAL "is-logical"
 #define FB_VAR_IS_USERSPACE "is-userspace"
+#define FB_VAR_IS_FORCE_DEBUGGABLE "is-force-debuggable"
 #define FB_VAR_HW_REVISION "hw-revision"
 #define FB_VAR_VARIANT "variant"
 #define FB_VAR_OFF_MODE_CHARGE_STATE "off-mode-charge"
 #define FB_VAR_BATTERY_VOLTAGE "battery-voltage"
+#define FB_VAR_BATTERY_SOC "battery-soc"
 #define FB_VAR_BATTERY_SOC_OK "battery-soc-ok"
 #define FB_VAR_SUPER_PARTITION_NAME "super-partition-name"
 #define FB_VAR_SNAPSHOT_UPDATE_STATUS "snapshot-update-status"
@@ -77,3 +80,7 @@
 #define FB_VAR_FIRST_API_LEVEL "first-api-level"
 #define FB_VAR_SECURITY_PATCH_LEVEL "security-patch-level"
 #define FB_VAR_TREBLE_ENABLED "treble-enabled"
+#define FB_VAR_MAX_FETCH_SIZE "max-fetch-size"
+#define FB_VAR_DMESG "dmesg"
+#define FB_VAR_BATTERY_SERIAL_NUMBER "battery-serial-number"
+#define FB_VAR_BATTERY_PART_STATUS "battery-part-status"

@@ -16,6 +16,7 @@
 
 #include "service.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/securebits.h>
@@ -25,6 +26,7 @@
 #include <sys/time.h>
 #include <termios.h>
 #include <unistd.h>
+#include <thread>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -35,13 +37,20 @@
 #include <cutils/sockets.h>
 #include <processgroup/processgroup.h>
 #include <selinux/selinux.h>
+#include <sys/signalfd.h>
 
+#include <string>
+
+#include "interprocess_fifo.h"
 #include "lmkd_service.h"
 #include "service_list.h"
 #include "util.h"
 
+#if defined(__BIONIC__)
+#include <bionic/reserved_signals.h>
+#endif
+
 #ifdef INIT_FULL_SOURCES
-#include <ApexProperties.sysprop.h>
 #include <android/api-level.h>
 
 #include "mount_namespace.h"
@@ -53,12 +62,14 @@
 
 using android::base::boot_clock;
 using android::base::GetBoolProperty;
+using android::base::GetIntProperty;
 using android::base::GetProperty;
 using android::base::Join;
 using android::base::make_scope_guard;
 using android::base::SetProperty;
 using android::base::StartsWith;
 using android::base::StringPrintf;
+using android::base::unique_fd;
 using android::base::WriteStringToFile;
 
 namespace android {
@@ -125,23 +136,18 @@ static bool ExpandArgsAndExecv(const std::vector<std::string>& args, bool sigsto
     return execv(c_strings[0], c_strings.data()) == 0;
 }
 
-static bool AreRuntimeApexesReady() {
-    struct stat buf;
-    return stat("/apex/com.android.art/", &buf) == 0 &&
-           stat("/apex/com.android.runtime/", &buf) == 0;
-}
-
 unsigned long Service::next_start_order_ = 1;
 bool Service::is_exec_service_running_ = false;
 
 Service::Service(const std::string& name, Subcontext* subcontext_for_restart_commands,
-                 const std::vector<std::string>& args, bool from_apex)
-    : Service(name, 0, 0, 0, {}, 0, "", subcontext_for_restart_commands, args, from_apex) {}
+                 const std::string& filename, const std::vector<std::string>& args)
+    : Service(name, 0, std::nullopt, 0, {}, 0, "", subcontext_for_restart_commands, filename,
+              args) {}
 
-Service::Service(const std::string& name, unsigned flags, uid_t uid, gid_t gid,
+Service::Service(const std::string& name, unsigned flags, std::optional<uid_t> uid, gid_t gid,
                  const std::vector<gid_t>& supp_gids, int namespace_flags,
                  const std::string& seclabel, Subcontext* subcontext_for_restart_commands,
-                 const std::vector<std::string>& args, bool from_apex)
+                 const std::string& filename, const std::vector<std::string>& args)
     : name_(name),
       classnames_({"default"}),
       flags_(flags),
@@ -149,7 +155,7 @@ Service::Service(const std::string& name, unsigned flags, uid_t uid, gid_t gid,
       crash_count_(0),
       proc_attr_{.ioprio_class = IoSchedClass_NONE,
                  .ioprio_pri = 0,
-                 .uid = uid,
+                 .parsed_uid = uid,
                  .gid = gid,
                  .supp_gids = supp_gids,
                  .priority = 0},
@@ -161,7 +167,7 @@ Service::Service(const std::string& name, unsigned flags, uid_t uid, gid_t gid,
       oom_score_adjust_(DEFAULT_OOM_SCORE_ADJUST),
       start_order_(0),
       args_(args),
-      from_apex_(from_apex) {}
+      filename_(filename) {}
 
 void Service::NotifyStateChange(const std::string& new_state) const {
     if ((flags_ & SVC_TEMPORARY) != 0) {
@@ -190,28 +196,20 @@ void Service::NotifyStateChange(const std::string& new_state) const {
     }
 }
 
-void Service::KillProcessGroup(int signal, bool report_oneshot) {
-    // If we've already seen a successful result from killProcessGroup*(), then we have removed
-    // the cgroup already and calling these functions a second time will simply result in an error.
-    // This is true regardless of which signal was sent.
-    // These functions handle their own logging, so no additional logging is needed.
-    if (!process_cgroup_empty_) {
+void Service::KillProcessGroup(int signal) {
+    // Always attempt the process kill if process is still running.
+    // Cgroup clean up routines are idempotent. It's safe to call
+    // killProcessGroup repeatedly. During shutdown, `init` will
+    // call this function to send SIGTERM/SIGKILL to all processes.
+    // These signals must be sent for a successful shutdown.
+    if (!process_cgroup_empty_ || IsRunning()) {
         LOG(INFO) << "Sending signal " << signal << " to service '" << name_ << "' (pid " << pid_
                   << ") process group...";
-        int max_processes = 0;
         int r;
         if (signal == SIGTERM) {
-            r = killProcessGroupOnce(proc_attr_.uid, pid_, signal, &max_processes);
+            r = killProcessGroupOnce(uid(), pid_, signal);
         } else {
-            r = killProcessGroup(proc_attr_.uid, pid_, signal, &max_processes);
-        }
-
-        if (report_oneshot && max_processes > 0) {
-            LOG(WARNING)
-                    << "Killed " << max_processes
-                    << " additional processes from a oneshot process group for service '" << name_
-                    << "'. This is new behavior, previously child processes would not be killed in "
-                       "this case.";
+            r = killProcessGroup(uid(), pid_, signal);
         }
 
         if (r == 0) process_cgroup_empty_ = true;
@@ -222,9 +220,9 @@ void Service::KillProcessGroup(int signal, bool report_oneshot) {
     }
 }
 
-void Service::SetProcessAttributesAndCaps() {
+void Service::SetProcessAttributesAndCaps(InterprocessFifo setsid_finished) {
     // Keep capabilites on uid change.
-    if (capabilities_ && proc_attr_.uid) {
+    if (capabilities_ && uid()) {
         // If Android is running in a container, some securebits might already
         // be locked, so don't change those.
         unsigned long securebits = prctl(PR_GET_SECUREBITS);
@@ -237,7 +235,7 @@ void Service::SetProcessAttributesAndCaps() {
         }
     }
 
-    if (auto result = SetProcessAttributes(proc_attr_); !result.ok()) {
+    if (auto result = SetProcessAttributes(proc_attr_, std::move(setsid_finished)); !result.ok()) {
         LOG(FATAL) << "cannot set attribute for " << name_ << ": " << result.error();
     }
 
@@ -251,7 +249,7 @@ void Service::SetProcessAttributesAndCaps() {
         if (!SetCapsForExec(*capabilities_)) {
             LOG(FATAL) << "cannot set capabilities for " << name_;
         }
-    } else if (proc_attr_.uid) {
+    } else if (uid()) {
         // Inheritable caps can be non-zero when running in a container.
         if (!DropInheritableCaps()) {
             LOG(FATAL) << "cannot drop inheritable caps for " << name_;
@@ -261,7 +259,7 @@ void Service::SetProcessAttributesAndCaps() {
 
 void Service::Reap(const siginfo_t& siginfo) {
     if (!(flags_ & SVC_ONESHOT) || (flags_ & SVC_RESTART)) {
-        KillProcessGroup(SIGKILL, false);
+        KillProcessGroup(SIGKILL);
     } else {
         // Legacy behavior from ~2007 until Android R: this else branch did not exist and we did not
         // kill the process group in this case.
@@ -269,12 +267,15 @@ void Service::Reap(const siginfo_t& siginfo) {
             // The new behavior in Android R is to kill these process groups in all cases.  The
             // 'true' parameter instructions KillProcessGroup() to report a warning message where it
             // detects a difference in behavior has occurred.
-            KillProcessGroup(SIGKILL, true);
+            KillProcessGroup(SIGKILL);
         }
     }
 
     // Remove any socket resources we may have created.
     for (const auto& socket : sockets_) {
+        if (socket.persist) {
+            continue;
+        }
         auto path = ANDROID_SOCKET_DIR "/" + socket.name;
         unlink(path.c_str());
     }
@@ -284,17 +285,23 @@ void Service::Reap(const siginfo_t& siginfo) {
     }
 
     if ((siginfo.si_code != CLD_EXITED || siginfo.si_status != 0) && on_failure_reboot_target_) {
-        LOG(ERROR) << "Service with 'reboot_on_failure' option failed, shutting down system.";
+        LOG(ERROR) << "Service " << name_
+                   << " has 'reboot_on_failure' option and failed, shutting down system.";
         trigger_shutdown(*on_failure_reboot_target_);
     }
 
     if (flags_ & SVC_EXEC) UnSetExec();
+
+    if (name_ == "zygote" || name_ == "zygote64") {
+        removeAllEmptyProcessGroups();
+    }
 
     if (flags_ & SVC_TEMPORARY) return;
 
     pid_ = 0;
     flags_ &= (~SVC_RUNNING);
     start_order_ = 0;
+    was_last_exit_ok_ = siginfo.si_code == CLD_EXITED && siginfo.si_status == 0;
 
     // Oneshot processes go into the disabled state on exit,
     // except when manually restarted.
@@ -309,28 +316,74 @@ void Service::Reap(const siginfo_t& siginfo) {
     }
 
 #if INIT_FULL_SOURCES
-    static bool is_apex_updatable = android::sysprop::ApexProperties::updatable().value_or(false);
+    static bool is_apex_updatable = true;
 #else
     static bool is_apex_updatable = false;
 #endif
-    const bool is_process_updatable = !pre_apexd_ && is_apex_updatable;
+    const bool use_default_mount_ns =
+            mount_namespace_.has_value() && *mount_namespace_ == NS_DEFAULT;
+    const bool is_process_updatable = use_default_mount_ns && is_apex_updatable;
+
+#if defined(__BIONIC__) && defined(SEGV_MTEAERR)
+    // As a precaution, we only upgrade a service once per reboot, to limit
+    // the potential impact.
+    //
+    // BIONIC_SIGNAL_ART_PROFILER is a magic value used by deuggerd to signal
+    // that the process crashed with SIGSEGV and SEGV_MTEAERR. This signal will
+    // never be seen otherwise in a crash, because it always gets handled by the
+    // profiling signal handlers in bionic. See also
+    // debuggerd/handler/debuggerd_handler.cpp.
+    bool should_upgrade_mte = siginfo.si_code != CLD_EXITED &&
+                              siginfo.si_status == BIONIC_SIGNAL_ART_PROFILER && !upgraded_mte_;
+
+    if (should_upgrade_mte) {
+        constexpr int kDefaultUpgradeSecs = 60;
+        int secs = GetIntProperty("persist.device_config.memory_safety_native.upgrade_secs.default",
+                                  kDefaultUpgradeSecs);
+        secs = GetIntProperty(
+                "persist.device_config.memory_safety_native.upgrade_secs.service." + name_, secs);
+        if (secs > 0) {
+            LOG(INFO) << "Upgrading service " << name_ << " to sync MTE for " << secs << " seconds";
+            once_environment_vars_.emplace_back("BIONIC_MEMTAG_UPGRADE_SECS", std::to_string(secs));
+            upgraded_mte_ = true;
+        } else {
+            LOG(INFO) << "Not upgrading service " << name_ << " to sync MTE due to device config";
+        }
+    }
+#endif
 
     // If we crash > 4 times in 'fatal_crash_window_' minutes or before boot_completed,
     // reboot into bootloader or set crashing property
     boot_clock::time_point now = boot_clock::now();
-    if (((flags_ & SVC_CRITICAL) || is_process_updatable) && !(flags_ & SVC_RESTART)) {
+    constexpr const char native_watchdog_reboot_time[] = "persist.init.svc.last_fatal_reboot_epoch";
+    uint64_t throttle_window =
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::hours(24)).count();
+    if (((flags_ & SVC_CRITICAL) || is_process_updatable) && !(flags_ & SVC_RESTART) &&
+        !was_last_exit_ok_) {
         bool boot_completed = GetBoolProperty("sys.boot_completed", false);
         if (now < time_crashed_ + fatal_crash_window_ || !boot_completed) {
             if (++crash_count_ > 4) {
-                auto exit_reason = boot_completed ?
-                    "in " + std::to_string(fatal_crash_window_.count()) + " minutes" :
-                    "before boot completed";
+                auto exit_reason =
+                        boot_completed
+                                ? "in " + std::to_string(fatal_crash_window_.count()) + " minutes"
+                                : "before boot completed";
                 if (flags_ & SVC_CRITICAL) {
                     if (!GetBoolProperty("init.svc_debug.no_fatal." + name_, false)) {
-                        // Aborts into `fatal_reboot_target_'.
-                        SetFatalRebootTarget(fatal_reboot_target_);
-                        LOG(FATAL) << "critical process '" << name_ << "' exited 4 times "
-                                   << exit_reason;
+                        uint64_t epoch_time =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+                        // Do not reboot again If it was already initiated in the last 24hrs
+                        if (epoch_time - GetIntProperty(native_watchdog_reboot_time, 0) >
+                            throttle_window) {
+                            SetProperty(native_watchdog_reboot_time, std::to_string(epoch_time));
+                            // Aborts into `fatal_reboot_target_'.
+                            SetFatalRebootTarget(fatal_reboot_target_);
+                            LOG(FATAL) << "critical process '" << name_ << "' exited 4 times "
+                                       << exit_reason;
+                        } else {
+                            LOG(INFO) << "Reboot already performed in last 24hrs because of crash.";
+                        }
                     }
                 } else {
                     LOG(ERROR) << "process with updatable components '" << name_
@@ -376,7 +429,7 @@ Result<void> Service::ExecStart() {
         }
     });
 
-    if (is_updatable() && !ServiceList::GetInstance().IsServicesUpdated()) {
+    if (is_updatable() && !IsDefaultMountNamespaceReady()) {
         // Don't delay the service for ExecStart() as the semantic is that
         // the caller might depend on the side effect of the execution.
         return Error() << "Cannot start an updatable service '" << name_
@@ -392,12 +445,142 @@ Result<void> Service::ExecStart() {
     flags_ |= SVC_EXEC;
     is_exec_service_running_ = true;
 
-    LOG(INFO) << "SVC_EXEC service '" << name_ << "' pid " << pid_ << " (uid " << proc_attr_.uid
-              << " gid " << proc_attr_.gid << "+" << proc_attr_.supp_gids.size() << " context "
+    LOG(INFO) << "SVC_EXEC service '" << name_ << "' pid " << pid_ << " (uid " << uid() << " gid "
+              << proc_attr_.gid << "+" << proc_attr_.supp_gids.size() << " context "
               << (!seclabel_.empty() ? seclabel_ : "default") << ") started; waiting...";
 
     reboot_on_failure.Disable();
     return {};
+}
+
+Result<void> Service::CheckConsole() {
+    if (!(flags_ & SVC_CONSOLE)) {
+        return {};
+    }
+
+    // On newer kernels, /dev/console will always exist because
+    // "console=ttynull" is hard-coded in CONFIG_CMDLINE. This new boot
+    // property should be set via "androidboot.serialconsole=0" to explicitly
+    // disable services requiring the console. For older kernels and boot
+    // images, not setting this at all will fall back to the old behavior
+    if (GetProperty("ro.boot.serialconsole", "") == "0") {
+        flags_ |= SVC_DISABLED;
+        return {};
+    }
+
+    if (proc_attr_.console.empty()) {
+        proc_attr_.console = "/dev/" + GetProperty("ro.boot.console", "console");
+    }
+
+    // Make sure that open call succeeds to ensure a console driver is
+    // properly registered for the device node
+    int console_fd = open(proc_attr_.console.c_str(), O_RDWR | O_CLOEXEC);
+    if (console_fd < 0) {
+        flags_ |= SVC_DISABLED;
+        return ErrnoError() << "Couldn't open console '" << proc_attr_.console << "'";
+    }
+    close(console_fd);
+    return {};
+}
+
+// Configures the memory cgroup properties for the service.
+void Service::ConfigureMemcg() {
+    if (swappiness_ != -1) {
+        if (!setProcessGroupSwappiness(uid(), pid_, swappiness_)) {
+            PLOG(ERROR) << "setProcessGroupSwappiness failed";
+        }
+    }
+
+    if (soft_limit_in_bytes_ != -1) {
+        if (!setProcessGroupSoftLimit(uid(), pid_, soft_limit_in_bytes_)) {
+            PLOG(ERROR) << "setProcessGroupSoftLimit failed";
+        }
+    }
+
+    size_t computed_limit_in_bytes = limit_in_bytes_;
+    if (limit_percent_ != -1) {
+        long page_size = sysconf(_SC_PAGESIZE);
+        long num_pages = sysconf(_SC_PHYS_PAGES);
+        if (page_size > 0 && num_pages > 0) {
+            size_t max_mem = SIZE_MAX;
+            if (size_t(num_pages) < SIZE_MAX / size_t(page_size)) {
+                max_mem = size_t(num_pages) * size_t(page_size);
+            }
+            computed_limit_in_bytes =
+                    std::min(computed_limit_in_bytes, max_mem / 100 * limit_percent_);
+        }
+    }
+
+    if (!limit_property_.empty()) {
+        // This ends up overwriting computed_limit_in_bytes but only if the
+        // property is defined.
+        computed_limit_in_bytes =
+                android::base::GetUintProperty(limit_property_, computed_limit_in_bytes, SIZE_MAX);
+    }
+
+    if (computed_limit_in_bytes != size_t(-1)) {
+        if (!setProcessGroupLimit(uid(), pid_, computed_limit_in_bytes)) {
+            PLOG(ERROR) << "setProcessGroupLimit failed";
+        }
+    }
+}
+
+// Enters namespaces, sets environment variables, writes PID files and runs the service executable.
+void Service::RunService(const std::vector<Descriptor>& descriptors,
+                         InterprocessFifo cgroups_activated, InterprocessFifo setsid_finished) {
+    if (auto result = EnterNamespaces(namespaces_, name_, mount_namespace_); !result.ok()) {
+        LOG(FATAL) << "Service '" << name_ << "' failed to set up namespaces: " << result.error();
+    }
+
+    for (const auto& [key, value] : once_environment_vars_) {
+        setenv(key.c_str(), value.c_str(), 1);
+    }
+    for (const auto& [key, value] : environment_vars_) {
+        setenv(key.c_str(), value.c_str(), 1);
+    }
+
+    for (const auto& descriptor : descriptors) {
+        descriptor.Publish();
+    }
+
+    if (auto result = WritePidToFiles(&writepid_files_); !result.ok()) {
+        LOG(ERROR) << "failed to write pid to files: " << result.error();
+    }
+
+    // Wait until the cgroups have been created and until the cgroup controllers have been
+    // activated.
+    Result<uint8_t> byte = cgroups_activated.Read();
+    if (!byte.ok()) {
+        LOG(ERROR) << name_ << ": failed to read from notification channel: " << byte.error();
+    }
+    cgroups_activated.Close();
+    if (*byte != kCgroupsActivated) {
+        LOG(FATAL) << "Service '" << name_  << "' failed to start due to a fatal error";
+        _exit(EXIT_FAILURE);
+    }
+
+    if (task_profiles_.size() > 0) {
+        bool succeeded = SelinuxGetVendorAndroidVersion() < __ANDROID_API_U__
+                                 ?
+                                 // Compatibility mode: apply the task profiles to the current
+                                 // thread.
+                                 SetTaskProfiles(getpid(), task_profiles_)
+                                 :
+                                 // Apply the task profiles to the current process.
+                                 SetProcessProfiles(getuid(), getpid(), task_profiles_);
+        if (!succeeded) {
+            LOG(ERROR) << "failed to set task profiles";
+        }
+    }
+
+    // As requested, set our gid, supplemental gids, uid, context, and
+    // priority. Aborts on failure.
+    SetProcessAttributesAndCaps(std::move(setsid_finished));
+
+    if (!ExpandArgsAndExecv(args_, sigstop_)) {
+        PLOG(ERROR) << "cannot execv('" << args_[0]
+                    << "'). See the 'Debugging init' section of init's README.md for tips";
+    }
 }
 
 Result<void> Service::Start() {
@@ -407,7 +590,7 @@ Result<void> Service::Start() {
         }
     });
 
-    if (is_updatable() && !ServiceList::GetInstance().IsServicesUpdated()) {
+    if (is_updatable() && !IsDefaultMountNamespaceReady()) {
         ServiceList::GetInstance().DelayService(*this);
         return Error() << "Cannot start an updatable service '" << name_
                        << "' before configs from APEXes are all loaded. "
@@ -415,9 +598,7 @@ Result<void> Service::Start() {
     }
 
     bool disabled = (flags_ & (SVC_DISABLED | SVC_RESET));
-    // Starting a service removes it from the disabled or reset state and
-    // immediately takes it out of the restarting state if it was in there.
-    flags_ &= (~(SVC_DISABLED|SVC_RESTARTING|SVC_RESET|SVC_RESTART|SVC_DISABLED_START));
+    ResetFlagsForStart();
 
     // Running processes require no additional work --- if they're in the
     // process of exiting, we've ensured that they will immediately restart
@@ -428,25 +609,26 @@ Result<void> Service::Start() {
         if ((flags_ & SVC_ONESHOT) && disabled) {
             flags_ |= SVC_RESTART;
         }
+
+        LOG(INFO) << "service '" << name_
+                  << "' requested start, but it is already running (flags: " << flags_ << ")";
+
         // It is not an error to try to start a service that is already running.
         reboot_on_failure.Disable();
         return {};
     }
 
-    bool needs_console = (flags_ & SVC_CONSOLE);
-    if (needs_console) {
-        if (proc_attr_.console.empty()) {
-            proc_attr_.console = "/dev/" + GetProperty("ro.boot.console", "console");
-        }
+    // cgroups_activated is used for communication from the parent to the child
+    // while setsid_finished is used for communication from the child process to
+    // the parent process. These two communication channels are separate because
+    // combining these into a single communication channel would introduce a
+    // race between the Write() calls by the parent and by the child.
+    InterprocessFifo cgroups_activated, setsid_finished;
+    OR_RETURN(cgroups_activated.Initialize());
+    OR_RETURN(setsid_finished.Initialize());
 
-        // Make sure that open call succeeds to ensure a console driver is
-        // properly registered for the device node
-        int console_fd = open(proc_attr_.console.c_str(), O_RDWR | O_CLOEXEC);
-        if (console_fd < 0) {
-            flags_ |= SVC_DISABLED;
-            return ErrnoError() << "Couldn't open console '" << proc_attr_.console << "'";
-        }
-        close(console_fd);
+    if (Result<void> result = CheckConsole(); !result.ok()) {
+        return result;
     }
 
     struct stat sb;
@@ -466,25 +648,10 @@ Result<void> Service::Start() {
         scon = *result;
     }
 
-    if (!AreRuntimeApexesReady() && !pre_apexd_) {
-        // If this service is started before the Runtime and ART APEXes get
-        // available, mark it as pre-apexd one. Note that this marking is
-        // permanent. So for example, if the service is re-launched (e.g., due
-        // to crash), it is still recognized as pre-apexd... for consistency.
-        pre_apexd_ = true;
+    if (!mount_namespace_.has_value()) {
+        // remember from which mount namespace the service should start
+        SetMountNamespace();
     }
-
-    // For pre-apexd services, override mount namespace as "bootstrap" one before starting.
-    // Note: "ueventd" is supposed to be run in "default" mount namespace even if it's pre-apexd
-    // to support loading firmwares from APEXes.
-    std::optional<MountNamespace> override_mount_namespace;
-    if (name_ == "ueventd") {
-        override_mount_namespace = NS_DEFAULT;
-    } else if (pre_apexd_) {
-        override_mount_namespace = NS_BOOTSTRAP;
-    }
-
-    post_data_ = ServiceList::GetInstance().IsPostData();
 
     LOG(INFO) << "starting service '" << name_ << "'...";
 
@@ -514,45 +681,21 @@ Result<void> Service::Start() {
 
     if (pid == 0) {
         umask(077);
-
-        if (auto result = EnterNamespaces(namespaces_, name_, override_mount_namespace);
-            !result.ok()) {
-            LOG(FATAL) << "Service '" << name_
-                       << "' failed to set up namespaces: " << result.error();
-        }
-
-        for (const auto& [key, value] : environment_vars_) {
-            setenv(key.c_str(), value.c_str(), 1);
-        }
-
-        for (const auto& descriptor : descriptors) {
-            descriptor.Publish();
-        }
-
-        if (auto result = WritePidToFiles(&writepid_files_); !result.ok()) {
-            LOG(ERROR) << "failed to write pid to files: " << result.error();
-        }
-
-        if (task_profiles_.size() > 0 && !SetTaskProfiles(getpid(), task_profiles_)) {
-            LOG(ERROR) << "failed to set task profiles";
-        }
-
-        // As requested, set our gid, supplemental gids, uid, context, and
-        // priority. Aborts on failure.
-        SetProcessAttributesAndCaps();
-
-        if (!ExpandArgsAndExecv(args_, sigstop_)) {
-            PLOG(ERROR) << "cannot execv('" << args_[0]
-                        << "'). See the 'Debugging init' section of init's README.md for tips";
-        }
-
+        cgroups_activated.CloseWriteFd();
+        setsid_finished.CloseReadFd();
+        RunService(descriptors, std::move(cgroups_activated), std::move(setsid_finished));
         _exit(127);
+    } else {
+        cgroups_activated.CloseReadFd();
+        setsid_finished.CloseWriteFd();
     }
 
     if (pid < 0) {
         pid_ = 0;
         return ErrnoError() << "Failed to fork";
     }
+
+    once_environment_vars_.clear();
 
     if (oom_score_adjust_ != DEFAULT_OOM_SCORE_ADJUST) {
         std::string oom_str = std::to_string(oom_score_adjust_);
@@ -568,60 +711,145 @@ Result<void> Service::Start() {
     start_order_ = next_start_order_++;
     process_cgroup_empty_ = false;
 
-    bool use_memcg = swappiness_ != -1 || soft_limit_in_bytes_ != -1 || limit_in_bytes_ != -1 ||
-                      limit_percent_ != -1 || !limit_property_.empty();
-    errno = -createProcessGroup(proc_attr_.uid, pid_, use_memcg);
-    if (errno != 0) {
-        PLOG(ERROR) << "createProcessGroup(" << proc_attr_.uid << ", " << pid_
-                    << ") failed for service '" << name_ << "'";
-    } else if (use_memcg) {
-        if (swappiness_ != -1) {
-            if (!setProcessGroupSwappiness(proc_attr_.uid, pid_, swappiness_)) {
-                PLOG(ERROR) << "setProcessGroupSwappiness failed";
+    if (CgroupsAvailable()) {
+        bool use_memcg = swappiness_ != -1 || soft_limit_in_bytes_ != -1 || limit_in_bytes_ != -1 ||
+                         limit_percent_ != -1 || !limit_property_.empty();
+        errno = -createProcessGroup(uid(), pid_, use_memcg);
+        if (errno != 0) {
+            Result<void> result = cgroups_activated.Write(kActivatingCgroupsFailed);
+            if (!result.ok()) {
+                return Error() << "Sending notification failed: " << result.error();
             }
+            return Error() << "createProcessGroup(" << uid() << ", " << pid_ << ", " << use_memcg
+                           << ") failed for service '" << name_ << "': " << strerror(errno);
         }
 
-        if (soft_limit_in_bytes_ != -1) {
-            if (!setProcessGroupSoftLimit(proc_attr_.uid, pid_, soft_limit_in_bytes_)) {
-                PLOG(ERROR) << "setProcessGroupSoftLimit failed";
-            }
-        }
+        // When the blkio controller is mounted in the v1 hierarchy, NormalIoPriority is
+        // the default (/dev/blkio). When the blkio controller is mounted in the v2 hierarchy, the
+        // NormalIoPriority profile has to be applied explicitly.
+        SetProcessProfiles(uid(), pid_, {"NormalIoPriority"});
 
-        size_t computed_limit_in_bytes = limit_in_bytes_;
-        if (limit_percent_ != -1) {
-            long page_size = sysconf(_SC_PAGESIZE);
-            long num_pages = sysconf(_SC_PHYS_PAGES);
-            if (page_size > 0 && num_pages > 0) {
-                size_t max_mem = SIZE_MAX;
-                if (size_t(num_pages) < SIZE_MAX / size_t(page_size)) {
-                    max_mem = size_t(num_pages) * size_t(page_size);
-                }
-                computed_limit_in_bytes =
-                        std::min(computed_limit_in_bytes, max_mem / 100 * limit_percent_);
-            }
-        }
-
-        if (!limit_property_.empty()) {
-            // This ends up overwriting computed_limit_in_bytes but only if the
-            // property is defined.
-            computed_limit_in_bytes = android::base::GetUintProperty(
-                    limit_property_, computed_limit_in_bytes, SIZE_MAX);
-        }
-
-        if (computed_limit_in_bytes != size_t(-1)) {
-            if (!setProcessGroupLimit(proc_attr_.uid, pid_, computed_limit_in_bytes)) {
-                PLOG(ERROR) << "setProcessGroupLimit failed";
-            }
+        if (use_memcg) {
+            ConfigureMemcg();
         }
     }
 
     if (oom_score_adjust_ != DEFAULT_OOM_SCORE_ADJUST) {
-        LmkdRegister(name_, proc_attr_.uid, pid_, oom_score_adjust_);
+        LmkdRegister(name_, uid(), pid_, oom_score_adjust_);
     }
+
+    if (Result<void> result = cgroups_activated.Write(kCgroupsActivated); !result.ok()) {
+        return Error() << "Sending cgroups activated notification failed: " << result.error();
+    }
+
+    cgroups_activated.Close();
+
+    // Call setpgid() from the parent process to make sure that this call has
+    // finished before the parent process calls kill(-pgid, ...).
+    if (!RequiresConsole(proc_attr_)) {
+        if (setpgid(pid, pid) < 0) {
+            switch (errno) {
+                case EACCES:  // Child has already performed setpgid() followed by execve().
+                case ESRCH:   // Child process no longer exists.
+                    break;
+                default:
+                    PLOG(ERROR) << "setpgid() from parent failed";
+            }
+        }
+    } else {
+        // The Read() call below will return an error if the child is killed.
+        if (Result<uint8_t> result = setsid_finished.Read();
+            !result.ok() || *result != kSetSidFinished) {
+            if (!result.ok()) {
+                return Error() << "Waiting for setsid() failed: " << result.error();
+            } else {
+                return Error() << "Waiting for setsid() failed: " << static_cast<uint32_t>(*result)
+                               << " <> " << static_cast<uint32_t>(kSetSidFinished);
+            }
+        }
+    }
+
+    setsid_finished.Close();
 
     NotifyStateChange("running");
     reboot_on_failure.Disable();
+
+    LOG(INFO) << "... started service '" << name_ << "' has pid " << pid_;
+
     return {};
+}
+
+// Set mount namespace for the service.
+// The reason why remember the mount namespace:
+//   If this service is started before APEXes and corresponding linker configuration
+//   get available, mark it as pre-apexd one. Note that this marking is
+//   permanent. So for example, if the service is re-launched (e.g., due
+//   to crash), it is still recognized as pre-apexd... for consistency.
+void Service::SetMountNamespace() {
+    // APEXd is always started in the "current" namespace because it is the process to set up
+    // the current namespace. So, leave mount_namespace_ as empty.
+    if (args_[0] == "/system/bin/apexd") {
+        return;
+    }
+    // Services in the following list start in the "default" mount namespace.
+    // Note that they should use bootstrap bionic if they start before APEXes are ready.
+    static const std::set<std::string> kUseDefaultMountNamespace = {
+            "ueventd",           // load firmwares from APEXes
+            "hwservicemanager",  // load VINTF fragments from APEXes
+            "servicemanager",    // load VINTF fragments from APEXes
+    };
+    if (kUseDefaultMountNamespace.find(name_) != kUseDefaultMountNamespace.end()) {
+        mount_namespace_ = NS_DEFAULT;
+        return;
+    }
+    // Use the "default" mount namespace only if it's ready
+    mount_namespace_ = IsDefaultMountNamespaceReady() ? NS_DEFAULT : NS_BOOTSTRAP;
+}
+
+static int ThreadCount() {
+    std::unique_ptr<DIR, decltype(&closedir)> dir(opendir("/proc/self/task"), closedir);
+    if (!dir) {
+        return -1;
+    }
+
+    int count = 0;
+    dirent* entry;
+    while ((entry = readdir(dir.get())) != nullptr) {
+        if (entry->d_name[0] != '.') {
+            count++;
+        }
+    }
+    return count;
+}
+
+// Must be called BEFORE any threads are created. See also the sigprocmask() man page.
+unique_fd Service::CreateSigchldFd() {
+    CHECK_EQ(ThreadCount(), 1);
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &mask, nullptr) < 0) {
+        PLOG(FATAL) << "Failed to block SIGCHLD";
+    }
+
+    return unique_fd(signalfd(-1, &mask, SFD_CLOEXEC));
+}
+
+void Service::SetStartedInFirstStage(pid_t pid) {
+    LOG(INFO) << "adding first-stage service '" << name_ << "'...";
+
+    time_started_ = boot_clock::now();  // not accurate, but doesn't matter here
+    pid_ = pid;
+    flags_ |= SVC_RUNNING;
+    start_order_ = next_start_order_++;
+
+    NotifyStateChange("running");
+}
+
+void Service::ResetFlagsForStart() {
+    // Starting a service removes it from the disabled or reset state and
+    // immediately takes it out of the restarting state if it was in there.
+    flags_ &= ~(SVC_DISABLED | SVC_RESTARTING | SVC_RESET | SVC_RESTART | SVC_DISABLED_START);
 }
 
 Result<void> Service::StartIfNotDisabled() {
@@ -643,25 +871,6 @@ Result<void> Service::Enable() {
 
 void Service::Reset() {
     StopOrReset(SVC_RESET);
-}
-
-void Service::ResetIfPostData() {
-    if (post_data_) {
-        if (flags_ & SVC_RUNNING) {
-            running_at_post_data_reset_ = true;
-        }
-        StopOrReset(SVC_RESET);
-    }
-}
-
-Result<void> Service::StartIfPostData() {
-    // Start the service, but only if it was started after /data was mounted,
-    // and it was still running when we reset the post-data services.
-    if (running_at_post_data_reset_) {
-        return Start();
-    }
-
-    return {};
 }
 
 void Service::Stop() {
@@ -709,6 +918,8 @@ void Service::StopOrReset(int how) {
 
     if ((how != SVC_DISABLED) && (how != SVC_RESET) && (how != SVC_RESTART)) {
         // An illegal flag: default to SVC_DISABLED.
+        LOG(ERROR) << "service '" << name_ << "' requested unknown flag " << how
+                   << ", defaulting to disabling it.";
         how = SVC_DISABLED;
     }
 
@@ -727,6 +938,10 @@ void Service::StopOrReset(int how) {
     }
 
     if (pid_) {
+        if (flags_ & SVC_GENTLE_KILL) {
+            KillProcessGroup(SIGTERM);
+            if (!process_cgroup_empty()) std::this_thread::sleep_for(200ms);
+        }
         KillProcessGroup(SIGKILL);
         NotifyStateChange("stopping");
     } else {
@@ -791,7 +1006,20 @@ Result<std::unique_ptr<Service>> Service::MakeTemporaryOneshotService(
     }
 
     return std::make_unique<Service>(name, flags, *uid, *gid, supp_gids, namespace_flags, seclabel,
-                                     nullptr, str_args, false);
+                                     nullptr, /*filename=*/"", str_args);
+}
+
+// This is used for snapuserd_proxy, which hands off a socket to snapuserd. It's
+// a special case to support the daemon launched in first-stage init. The persist
+// feature is not part of the init language and is only used here.
+bool Service::MarkSocketPersistent(const std::string& socket_name) {
+    for (auto& socket : sockets_) {
+        if (socket.name == socket_name) {
+            socket.persist = true;
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace init

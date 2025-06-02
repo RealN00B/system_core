@@ -1,23 +1,22 @@
 {
   "requireLibs": [
-    // Keep in sync with the "platform" namespace in art/build/apex/ld.config.txt.
-    "libdexfile_external.so",
-    "libdexfiled_external.so",
+    "libandroidicu.so",
+    "libdexfile.so",
+    "libdexfiled.so",
+    "libicu.so",
+    "libjdwp.so",
     "libnativebridge.so",
     "libnativehelper.so",
     "libnativeloader.so",
-    "libandroidicu.so",
-    "libicu.so",
-    // TODO(b/122876336): Remove libpac.so once it's migrated to Webview
-    "libpac.so",
+    "libsigchain.so",
     // TODO(b/120786417 or b/134659294): libicuuc.so
     // and libicui18n.so are kept for app compat.
     "libicui18n.so",
     "libicuuc.so",
     // resolv
     "libnetd_resolv.so",
-    // nn
-    "libneuralnetworks.so",
+    // netd
+    "libnetd_updatable.so",
     // statsd
     "libstatspull.so",
     "libstatssocket.so",
@@ -25,5 +24,14 @@
     "libadb_pairing_auth.so",
     "libadb_pairing_connection.so",
     "libadb_pairing_server.so"
+
+    // LLNDK libraries in APEXes will be added automatically from the build,
+    // using build variable LLNDK_MOVED_TO_APEX_LIBRARIES.
+  ],
+  "provideLibs": [
+    "libaptX_encoder.so",
+    "libaptXHD_encoder.so",
+    "libEGL.so",
+    "libGLESv2.so"
   ]
 }

@@ -19,19 +19,18 @@ package {
 cc_library {
     name: "libcgrouprc",
     host_supported: true,
-    ramdisk_available: true,
-    vendor_ramdisk_available: true,
-    recovery_available: true,
     // Do not ever mark this as vendor_available; otherwise, vendor modules
     // that links to the static library will behave unexpectedly. All on-device
     // modules should use libprocessgroup which links to the LL-NDK library
     // defined below. The static library is built for tests.
     vendor_available: false,
     native_bridge_supported: true,
-    llndk_stubs: "libcgrouprc.llndk",
+    llndk: {
+        symbol_file: "libcgrouprc.map.txt",
+    },
     srcs: [
-        "cgroup_controller.cpp",
-        "cgroup_file.cpp",
+        "a_cgroup_controller.cpp",
+        "a_cgroup_file.cpp",
     ],
     cflags: [
         "-Wall",
@@ -47,7 +46,8 @@ cc_library {
         "libbase",
     ],
     static_libs: [
-        "libcgrouprc_format",
+        "libjsoncpp",
+        "libprocessgroup_util",
     ],
     stubs: {
         symbol_file: "libcgrouprc.map.txt",
@@ -58,13 +58,4 @@ cc_library {
             version_script: "libcgrouprc.map.txt",
         },
     },
-}
-
-llndk_library {
-    name: "libcgrouprc.llndk",
-    symbol_file: "libcgrouprc.map.txt",
-    native_bridge_supported: true,
-    export_include_dirs: [
-        "include",
-    ],
 }

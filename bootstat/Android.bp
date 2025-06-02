@@ -35,7 +35,7 @@ cc_defaults {
         "libcutils",
         "liblog",
     ],
-    static_libs: ["libgtest_prod"],
+    header_libs: ["libgtest_prod_headers"],
 }
 
 // bootstat static library
@@ -72,9 +72,6 @@ cc_binary {
     ],
     init_rc: ["bootstat.rc"],
     product_variables: {
-        pdk: {
-            enabled: false,
-        },
         debuggable: {
             init_rc: ["bootstat-debug.rc"],
         },

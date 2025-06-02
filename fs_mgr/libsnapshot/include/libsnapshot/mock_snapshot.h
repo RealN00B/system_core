@@ -26,22 +26,25 @@ class MockSnapshotManager : public ISnapshotManager {
     MOCK_METHOD(bool, BeginUpdate, (), (override));
     MOCK_METHOD(bool, CancelUpdate, (), (override));
     MOCK_METHOD(bool, FinishedSnapshotWrites, (bool wipe), (override));
-    MOCK_METHOD(bool, InitiateMerge, (uint64_t * cow_file_size), (override));
+    MOCK_METHOD(void, UpdateCowStats, (ISnapshotMergeStats * stats), (override));
+    MOCK_METHOD(MergeFailureCode, ReadMergeFailureCode, (), (override));
+    MOCK_METHOD(bool, InitiateMerge, (), (override));
 
     MOCK_METHOD(UpdateState, ProcessUpdateState,
                 (const std::function<bool()>& callback, const std::function<bool()>& before_cancel),
                 (override));
     MOCK_METHOD(UpdateState, GetUpdateState, (double* progress), (override));
     MOCK_METHOD(bool, UpdateUsesCompression, (), (override));
+    MOCK_METHOD(bool, UpdateUsesUserSnapshots, (), (override));
     MOCK_METHOD(Return, CreateUpdateSnapshots,
                 (const chromeos_update_engine::DeltaArchiveManifest& manifest), (override));
     MOCK_METHOD(bool, MapUpdateSnapshot,
                 (const android::fs_mgr::CreateLogicalPartitionParams& params,
                  std::string* snapshot_path),
                 (override));
-    MOCK_METHOD(std::unique_ptr<ISnapshotWriter>, OpenSnapshotWriter,
+    MOCK_METHOD(std::unique_ptr<ICowWriter>, OpenSnapshotWriter,
                 (const android::fs_mgr::CreateLogicalPartitionParams& params,
-                 const std::optional<std::string>&),
+                 std::optional<uint64_t>),
                 (override));
     MOCK_METHOD(bool, UnmapUpdateSnapshot, (const std::string& target_partition_name), (override));
     MOCK_METHOD(bool, NeedSnapshotsInFirstStageMount, (), (override));
@@ -58,6 +61,8 @@ class MockSnapshotManager : public ISnapshotManager {
     MOCK_METHOD(bool, Dump, (std::ostream & os), (override));
     MOCK_METHOD(std::unique_ptr<AutoDevice>, EnsureMetadataMounted, (), (override));
     MOCK_METHOD(ISnapshotMergeStats*, GetSnapshotMergeStatsInstance, (), (override));
+    MOCK_METHOD(std::string, ReadSourceBuildFingerprint, (), (override));
+    MOCK_METHOD(void, SetMergeStatsFeatures, (ISnapshotMergeStats*), (override));
 };
 
 }  // namespace android::snapshot

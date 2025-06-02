@@ -14,11 +14,14 @@
  * limitations under the License.
  */
 
-#include <libdebuggerd/tombstone.h>
+#include <libdebuggerd/tombstone_proto_to_text.h>
+#include <libdebuggerd/utility_host.h>
 
 #include <inttypes.h>
 
+#include <algorithm>
 #include <functional>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -26,9 +29,10 @@
 #include <vector>
 
 #include <android-base/stringprintf.h>
+#include <android-base/strings.h>
 #include <android-base/unique_fd.h>
-#include <async_safe/log.h>
 
+#include "libdebuggerd/utility_host.h"
 #include "tombstone.pb.h"
 
 using android::base::StringAppendF;
@@ -38,13 +42,30 @@ using android::base::StringPrintf;
 #define CBL(...) CB(true, __VA_ARGS__)
 #define CBS(...) CB(false, __VA_ARGS__)
 using CallbackType = std::function<void(const std::string& line, bool should_log)>;
+using SymbolizeCallbackType = std::function<void(const BacktraceFrame& frame)>;
 
-static const char* abi_string(const Tombstone& tombstone) {
-  switch (tombstone.arch()) {
+#define DESCRIBE_FLAG(flag) \
+  if (value & flag) {       \
+    desc += ", ";           \
+    desc += #flag;          \
+    value &= ~flag;         \
+  }
+
+static std::string describe_end(long value, std::string& desc) {
+  if (value) {
+    desc += StringPrintf(", unknown 0x%lx", value);
+  }
+  return desc.empty() ? "" : " (" + desc.substr(2) + ")";
+}
+
+static const char* abi_string(const Architecture& arch) {
+  switch (arch) {
     case Architecture::ARM32:
       return "arm";
     case Architecture::ARM64:
       return "arm64";
+    case Architecture::RISCV64:
+      return "riscv64";
     case Architecture::X86:
       return "x86";
     case Architecture::X86_64:
@@ -60,6 +81,8 @@ static int pointer_width(const Tombstone& tombstone) {
       return 4;
     case Architecture::ARM64:
       return 8;
+    case Architecture::RISCV64:
+      return 8;
     case Architecture::X86:
       return 4;
     case Architecture::X86_64:
@@ -69,11 +92,33 @@ static int pointer_width(const Tombstone& tombstone) {
   }
 }
 
+static uint64_t untag_address(Architecture arch, uint64_t addr) {
+  if (arch == Architecture::ARM64) {
+    return addr & ((1ULL << 56) - 1);
+  }
+  return addr;
+}
+
 static void print_thread_header(CallbackType callback, const Tombstone& tombstone,
                                 const Thread& thread, bool should_log) {
+  const char* process_name = "<unknown>";
+  if (!tombstone.command_line().empty()) {
+    process_name = tombstone.command_line()[0].c_str();
+    CB(should_log, "Cmdline: %s", android::base::Join(tombstone.command_line(), " ").c_str());
+  } else {
+    CB(should_log, "Cmdline: <unknown>");
+  }
   CB(should_log, "pid: %d, tid: %d, name: %s  >>> %s <<<", tombstone.pid(), thread.id(),
-     thread.name().c_str(), tombstone.process_name().c_str());
+     thread.name().c_str(), process_name);
   CB(should_log, "uid: %d", tombstone.uid());
+  if (thread.tagged_addr_ctrl() != -1) {
+    CB(should_log, "tagged_addr_ctrl: %016" PRIx64 "%s", thread.tagged_addr_ctrl(),
+       describe_tagged_addr_ctrl(thread.tagged_addr_ctrl()).c_str());
+  }
+  if (thread.pac_enabled_keys() != -1) {
+    CB(should_log, "pac_enabled_keys: %016" PRIx64 "%s", thread.pac_enabled_keys(),
+       describe_pac_enabled_keys(thread.pac_enabled_keys()).c_str());
+  }
 }
 
 static void print_register_row(CallbackType callback, int word_size,
@@ -104,6 +149,10 @@ static void print_thread_registers(CallbackType callback, const Tombstone& tombs
       special_registers = {"ip", "lr", "sp", "pc", "pst"};
       break;
 
+    case Architecture::RISCV64:
+      special_registers = {"ra", "sp", "pc"};
+      break;
+
     case Architecture::X86:
       special_registers = {"ebp", "esp", "eip"};
       break;
@@ -113,7 +162,8 @@ static void print_thread_registers(CallbackType callback, const Tombstone& tombs
       break;
 
     default:
-      async_safe_fatal("unknown architecture");
+      CBL("Unknown architecture %d printing thread registers", tombstone.arch());
+      return;
   }
 
   for (const auto& reg : thread.registers()) {
@@ -136,12 +186,12 @@ static void print_thread_registers(CallbackType callback, const Tombstone& tombs
   print_register_row(callback, word_size, special_row, should_log);
 }
 
-static void print_thread_backtrace(CallbackType callback, const Tombstone& tombstone,
-                                   const Thread& thread, bool should_log) {
-  CBS("");
-  CB(should_log, "backtrace:");
+static void print_backtrace(CallbackType callback, SymbolizeCallbackType symbolize,
+                            const Tombstone& tombstone,
+                            const google::protobuf::RepeatedPtrField<BacktraceFrame>& backtrace,
+                            bool should_log) {
   int index = 0;
-  for (const auto& frame : thread.current_backtrace()) {
+  for (const auto& frame : backtrace) {
     std::string function;
 
     if (!frame.function_name().empty()) {
@@ -154,21 +204,54 @@ static void print_thread_backtrace(CallbackType callback, const Tombstone& tombs
       build_id = StringPrintf(" (BuildId: %s)", frame.build_id().c_str());
     }
 
-    CB(should_log, "      #%02d pc %0*" PRIx64 "  %s%s%s", index++, pointer_width(tombstone) * 2,
-       frame.rel_pc(), frame.file_name().c_str(), function.c_str(), build_id.c_str());
+    std::string line =
+        StringPrintf("      #%02d pc %0*" PRIx64 "  %s", index++, pointer_width(tombstone) * 2,
+                     frame.rel_pc(), frame.file_name().c_str());
+    if (frame.file_map_offset() != 0) {
+      line += StringPrintf(" (offset 0x%" PRIx64 ")", frame.file_map_offset());
+    }
+    line += function + build_id;
+    CB(should_log, "%s", line.c_str());
+
+    symbolize(frame);
   }
+}
+
+static void print_thread_backtrace(CallbackType callback, SymbolizeCallbackType symbolize,
+                                   const Tombstone& tombstone, const Thread& thread,
+                                   bool should_log) {
+  CBS("");
+  CB(should_log, "%d total frames", thread.current_backtrace().size());
+  CB(should_log, "backtrace:");
+  if (!thread.backtrace_note().empty()) {
+    CB(should_log, "  NOTE: %s",
+       android::base::Join(thread.backtrace_note(), "\n  NOTE: ").c_str());
+  }
+  print_backtrace(callback, symbolize, tombstone, thread.current_backtrace(), should_log);
 }
 
 static void print_thread_memory_dump(CallbackType callback, const Tombstone& tombstone,
                                      const Thread& thread) {
   static constexpr size_t bytes_per_line = 16;
+  static_assert(bytes_per_line == kTagGranuleSize);
   int word_size = pointer_width(tombstone);
   for (const auto& mem : thread.memory_dump()) {
     CBS("");
-    CBS("memory near %s (%s):", mem.register_name().c_str(), mem.mapping_name().c_str());
+    if (mem.mapping_name().empty()) {
+      CBS("memory near %s:", mem.register_name().c_str());
+    } else {
+      CBS("memory near %s (%s):", mem.register_name().c_str(), mem.mapping_name().c_str());
+    }
     uint64_t addr = mem.begin_address();
     for (size_t offset = 0; offset < mem.memory().size(); offset += bytes_per_line) {
-      std::string line = StringPrintf("    %0*" PRIx64, word_size * 2, addr + offset);
+      uint64_t tagged_addr = addr;
+      if (mem.has_arm_mte_metadata() &&
+          mem.arm_mte_metadata().memory_tags().size() > offset / kTagGranuleSize) {
+        tagged_addr |=
+            static_cast<uint64_t>(mem.arm_mte_metadata().memory_tags()[offset / kTagGranuleSize])
+            << 56;
+      }
+      std::string line = StringPrintf("    %0*" PRIx64, word_size * 2, tagged_addr + offset);
 
       size_t bytes = std::min(bytes_per_line, mem.memory().size() - offset);
       for (size_t i = 0; i < bytes; i += word_size) {
@@ -197,56 +280,70 @@ static void print_thread_memory_dump(CallbackType callback, const Tombstone& tom
   }
 }
 
-static void print_thread(CallbackType callback, const Tombstone& tombstone, const Thread& thread) {
+static void print_thread(CallbackType callback, SymbolizeCallbackType symbolize,
+                         const Tombstone& tombstone, const Thread& thread) {
   print_thread_header(callback, tombstone, thread, false);
   print_thread_registers(callback, tombstone, thread, false);
-  print_thread_backtrace(callback, tombstone, thread, false);
+  print_thread_backtrace(callback, symbolize, tombstone, thread, false);
   print_thread_memory_dump(callback, tombstone, thread);
 }
 
-static void print_main_thread(CallbackType callback, const Tombstone& tombstone,
-                              const Thread& thread) {
-  print_thread_header(callback, tombstone, thread, true);
+static void print_tag_dump(CallbackType callback, const Tombstone& tombstone) {
+  if (!tombstone.has_signal_info()) return;
 
-  const Signal& signal_info = tombstone.signal_info();
-  std::string sender_desc;
+  const Signal& signal = tombstone.signal_info();
 
-  if (signal_info.has_sender()) {
-    sender_desc =
-        StringPrintf(" from pid %d, uid %d", signal_info.sender_pid(), signal_info.sender_uid());
+  if (!signal.has_fault_address() || !signal.has_fault_adjacent_metadata()) {
+    return;
   }
 
-  if (!tombstone.has_signal_info()) {
-    CBL("signal information missing");
-  } else {
-    std::string fault_addr_desc;
-    if (signal_info.has_fault_address()) {
-      fault_addr_desc = StringPrintf("0x%" PRIx64, signal_info.fault_address());
-    } else {
-      fault_addr_desc = "--------";
-    }
+  const MemoryDump& memory_dump = signal.fault_adjacent_metadata();
 
-    CBL("signal %d (%s), code %d (%s%s), fault addr %s", signal_info.number(),
-        signal_info.name().c_str(), signal_info.code(), signal_info.code_name().c_str(),
-        sender_desc.c_str(), fault_addr_desc.c_str());
+  if (!memory_dump.has_arm_mte_metadata() || memory_dump.arm_mte_metadata().memory_tags().empty()) {
+    return;
   }
 
-  if (tombstone.has_cause()) {
-    const Cause& cause = tombstone.cause();
-    CBL("Cause: %s", cause.human_readable().c_str());
-  }
-
-  if (!tombstone.abort_message().empty()) {
-    CBL("Abort message: '%s'", tombstone.abort_message().c_str());
-  }
-
-  print_thread_registers(callback, tombstone, thread, true);
-  print_thread_backtrace(callback, tombstone, thread, true);
-  print_thread_memory_dump(callback, tombstone, thread);
+  const std::string& tags = memory_dump.arm_mte_metadata().memory_tags();
 
   CBS("");
-  CBS("memory map (%d %s):", tombstone.memory_mappings().size(),
-      tombstone.memory_mappings().size() == 1 ? "entry" : "entries");
+  CBS("Memory tags around the fault address (0x%" PRIx64 "), one tag per %zu bytes:",
+      signal.fault_address(), kTagGranuleSize);
+  constexpr uintptr_t kRowStartMask = ~(kNumTagColumns * kTagGranuleSize - 1);
+
+  size_t tag_index = 0;
+  size_t num_tags = tags.length();
+  uintptr_t fault_granule =
+      untag_address(tombstone.arch(), signal.fault_address()) & ~(kTagGranuleSize - 1);
+  for (size_t row = 0; tag_index < num_tags; ++row) {
+    uintptr_t row_addr =
+        (memory_dump.begin_address() + row * kNumTagColumns * kTagGranuleSize) & kRowStartMask;
+    std::string row_contents;
+    bool row_has_fault = false;
+
+    for (size_t column = 0; column < kNumTagColumns; ++column) {
+      uintptr_t granule_addr = row_addr + column * kTagGranuleSize;
+      if (granule_addr < memory_dump.begin_address() ||
+          granule_addr >= memory_dump.begin_address() + num_tags * kTagGranuleSize) {
+        row_contents += " . ";
+      } else if (granule_addr == fault_granule) {
+        row_contents += StringPrintf("[%1hhx]", tags[tag_index++]);
+        row_has_fault = true;
+      } else {
+        row_contents += StringPrintf(" %1hhx ", tags[tag_index++]);
+      }
+    }
+
+    if (row_contents.back() == ' ') row_contents.pop_back();
+
+    if (row_has_fault) {
+      CBS("    =>0x%" PRIxPTR ":%s", row_addr, row_contents.c_str());
+    } else {
+      CBS("      0x%" PRIxPTR ":%s", row_addr, row_contents.c_str());
+    }
+  }
+}
+
+static void print_memory_maps(CallbackType callback, const Tombstone& tombstone) {
   int word_size = pointer_width(tombstone);
   const auto format_pointer = [word_size](uint64_t ptr) -> std::string {
     if (word_size == 8) {
@@ -258,8 +355,42 @@ static void print_main_thread(CallbackType callback, const Tombstone& tombstone,
     return StringPrintf("%0*" PRIx64, word_size * 2, ptr);
   };
 
+  std::string memory_map_header =
+      StringPrintf("memory map (%d %s):", tombstone.memory_mappings().size(),
+                   tombstone.memory_mappings().size() == 1 ? "entry" : "entries");
+
+  const Signal& signal_info = tombstone.signal_info();
+  bool has_fault_address = signal_info.has_fault_address();
+  uint64_t fault_address = untag_address(tombstone.arch(), signal_info.fault_address());
+  bool preamble_printed = false;
+  bool printed_fault_address_marker = false;
   for (const auto& map : tombstone.memory_mappings()) {
+    if (!preamble_printed) {
+      preamble_printed = true;
+      if (has_fault_address) {
+        if (fault_address < map.begin_address()) {
+          memory_map_header +=
+              StringPrintf("\n--->Fault address falls at %s before any mapped regions",
+                           format_pointer(fault_address).c_str());
+          printed_fault_address_marker = true;
+        } else {
+          memory_map_header += " (fault address prefixed with --->)";
+        }
+      }
+      CBS("%s", memory_map_header.c_str());
+    }
+
     std::string line = "    ";
+    if (has_fault_address && !printed_fault_address_marker) {
+      if (fault_address < map.begin_address()) {
+        printed_fault_address_marker = true;
+        CBS("--->Fault address falls at %s between mapped regions",
+            format_pointer(fault_address).c_str());
+      } else if (fault_address >= map.begin_address() && fault_address < map.end_address()) {
+        printed_fault_address_marker = true;
+        line = "--->";
+      }
+    }
     StringAppendF(&line, "%s-%s", format_pointer(map.begin_address()).c_str(),
                   format_pointer(map.end_address() - 1).c_str());
     StringAppendF(&line, " %s%s%s", map.read() ? "r" : "-", map.write() ? "w" : "-",
@@ -280,6 +411,130 @@ static void print_main_thread(CallbackType callback, const Tombstone& tombstone,
     }
 
     CBS("%s", line.c_str());
+  }
+
+  if (has_fault_address && !printed_fault_address_marker) {
+    CBS("--->Fault address falls at %s after any mapped regions",
+        format_pointer(fault_address).c_str());
+  }
+}
+
+static void print_main_thread(CallbackType callback, SymbolizeCallbackType symbolize,
+                              const Tombstone& tombstone, const Thread& thread) {
+  print_thread_header(callback, tombstone, thread, true);
+
+  const Signal& signal_info = tombstone.signal_info();
+  std::string sender_desc;
+
+  if (signal_info.has_sender()) {
+    sender_desc =
+        StringPrintf(" from pid %d, uid %d", signal_info.sender_pid(), signal_info.sender_uid());
+  }
+
+  bool is_async_mte_crash = false;
+  bool is_mte_crash = false;
+  if (!tombstone.has_signal_info()) {
+    CBL("signal information missing");
+  } else {
+    std::string fault_addr_desc;
+    if (signal_info.has_fault_address()) {
+      fault_addr_desc =
+          StringPrintf("0x%0*" PRIx64, 2 * pointer_width(tombstone), signal_info.fault_address());
+    } else {
+      fault_addr_desc = "--------";
+    }
+
+    CBL("signal %d (%s), code %d (%s%s), fault addr %s", signal_info.number(),
+        signal_info.name().c_str(), signal_info.code(), signal_info.code_name().c_str(),
+        sender_desc.c_str(), fault_addr_desc.c_str());
+#ifdef SEGV_MTEAERR
+    is_async_mte_crash = signal_info.number() == SIGSEGV && signal_info.code() == SEGV_MTEAERR;
+    is_mte_crash = is_async_mte_crash ||
+                   (signal_info.number() == SIGSEGV && signal_info.code() == SEGV_MTESERR);
+#endif
+  }
+
+  if (tombstone.causes_size() == 1) {
+    CBL("Cause: %s", tombstone.causes(0).human_readable().c_str());
+  }
+
+  if (!tombstone.abort_message().empty()) {
+    CBL("Abort message: '%s'", tombstone.abort_message().c_str());
+  }
+
+  for (const auto& crash_detail : tombstone.crash_details()) {
+    std::string oct_encoded_name = oct_encode(crash_detail.name());
+    std::string oct_encoded_data = oct_encode(crash_detail.data());
+    CBL("Extra crash detail: %s: '%s'", oct_encoded_name.c_str(), oct_encoded_data.c_str());
+  }
+
+  print_thread_registers(callback, tombstone, thread, true);
+  if (is_async_mte_crash) {
+    CBL("Note: This crash is a delayed async MTE crash. Memory corruption has occurred");
+    CBL("      in this process. The stack trace below is the first system call or context");
+    CBL("      switch that was executed after the memory corruption happened.");
+  }
+  print_thread_backtrace(callback, symbolize, tombstone, thread, true);
+
+  if (tombstone.causes_size() > 1) {
+    CBS("");
+    CBL("Note: multiple potential causes for this crash were detected, listing them in decreasing "
+        "order of likelihood.");
+  }
+
+  if (tombstone.has_stack_history_buffer()) {
+    for (const StackHistoryBufferEntry& shbe : tombstone.stack_history_buffer().entries()) {
+      std::string stack_record_str = StringPrintf(
+          "stack_record fp:0x%" PRIx64 " tag:0x%" PRIx64 " pc:%s+0x%" PRIx64, shbe.fp(), shbe.tag(),
+          shbe.addr().file_name().c_str(), shbe.addr().rel_pc());
+      if (!shbe.addr().build_id().empty()) {
+        StringAppendF(&stack_record_str, " (BuildId: %s)", shbe.addr().build_id().c_str());
+      }
+
+      CBL("%s", stack_record_str.c_str());
+    }
+  }
+
+  for (const Cause& cause : tombstone.causes()) {
+    if (tombstone.causes_size() > 1) {
+      CBS("");
+      CBL("Cause: %s", cause.human_readable().c_str());
+    }
+
+    if (cause.has_memory_error() && cause.memory_error().has_heap()) {
+      const HeapObject& heap_object = cause.memory_error().heap();
+
+      if (heap_object.deallocation_backtrace_size() != 0) {
+        CBS("");
+        CBL("deallocated by thread %" PRIu64 ":", heap_object.deallocation_tid());
+        print_backtrace(callback, symbolize, tombstone, heap_object.deallocation_backtrace(), true);
+      }
+
+      if (heap_object.allocation_backtrace_size() != 0) {
+        CBS("");
+        CBL("allocated by thread %" PRIu64 ":", heap_object.allocation_tid());
+        print_backtrace(callback, symbolize, tombstone, heap_object.allocation_backtrace(), true);
+      }
+    }
+  }
+
+  print_tag_dump(callback, tombstone);
+
+  if (is_mte_crash) {
+    CBS("");
+    CBL("Learn more about MTE reports: "
+        "https://source.android.com/docs/security/test/memory-safety/mte-reports");
+  }
+
+  print_thread_memory_dump(callback, tombstone, thread);
+
+  CBS("");
+
+  // No memory maps to print.
+  if (!tombstone.memory_mappings().empty()) {
+    print_memory_maps(callback, tombstone);
+  } else {
+    CBS("No memory maps found");
   }
 }
 
@@ -307,12 +562,39 @@ void print_logs(CallbackType callback, const Tombstone& tombstone, int tail) {
   }
 }
 
-bool tombstone_proto_to_text(const Tombstone& tombstone, CallbackType callback) {
+static void print_guest_thread(CallbackType callback, SymbolizeCallbackType symbolize,
+                               const Tombstone& tombstone, const Thread& guest_thread, pid_t tid,
+                               bool should_log) {
+  CBS("--- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---");
+  CBS("Guest thread information for tid: %d", tid);
+  print_thread_registers(callback, tombstone, guest_thread, should_log);
+
+  CBS("");
+  CB(true, "%d total frames", guest_thread.current_backtrace().size());
+  CB(true, "backtrace:");
+  print_backtrace(callback, symbolize, tombstone, guest_thread.current_backtrace(), should_log);
+
+  print_thread_memory_dump(callback, tombstone, guest_thread);
+}
+
+bool tombstone_proto_to_text(const Tombstone& tombstone, CallbackType callback,
+                             SymbolizeCallbackType symbolize) {
   CBL("*** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***");
   CBL("Build fingerprint: '%s'", tombstone.build_fingerprint().c_str());
   CBL("Revision: '%s'", tombstone.revision().c_str());
-  CBL("ABI: '%s'", abi_string(tombstone));
+  CBL("ABI: '%s'", abi_string(tombstone.arch()));
+  if (tombstone.guest_arch() != Architecture::NONE) {
+    CBL("Guest architecture: '%s'", abi_string(tombstone.guest_arch()));
+  }
   CBL("Timestamp: %s", tombstone.timestamp().c_str());
+  CBL("Process uptime: %ds", tombstone.process_uptime());
+
+  // only print this info if the page size is not 4k or has been in 16k mode
+  if (tombstone.page_size() != 4096) {
+    CBL("Page size: %d bytes", tombstone.page_size());
+  } else if (tombstone.has_been_16kb_mode()) {
+    CBL("Has been in 16kb mode: yes");
+  }
 
   // Process header
   const auto& threads = tombstone.threads();
@@ -324,9 +606,16 @@ bool tombstone_proto_to_text(const Tombstone& tombstone, CallbackType callback) 
 
   const auto& main_thread = main_thread_it->second;
 
-  print_main_thread(callback, tombstone, main_thread);
+  print_main_thread(callback, symbolize, tombstone, main_thread);
 
   print_logs(callback, tombstone, 50);
+
+  const auto& guest_threads = tombstone.guest_threads();
+  auto main_guest_thread_it = guest_threads.find(tombstone.tid());
+  if (main_guest_thread_it != threads.end()) {
+    print_guest_thread(callback, symbolize, tombstone, main_guest_thread_it->second,
+                       tombstone.tid(), true);
+  }
 
   // protobuf's map is unordered, so sort the keys first.
   std::set<int> thread_ids;
@@ -338,7 +627,11 @@ bool tombstone_proto_to_text(const Tombstone& tombstone, CallbackType callback) 
 
   for (const auto& tid : thread_ids) {
     CBS("--- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---");
-    print_thread(callback, tombstone, threads.find(tid)->second);
+    print_thread(callback, symbolize, tombstone, threads.find(tid)->second);
+    auto guest_thread_it = guest_threads.find(tid);
+    if (guest_thread_it != guest_threads.end()) {
+      print_guest_thread(callback, symbolize, tombstone, guest_thread_it->second, tid, false);
+    }
   }
 
   if (tombstone.open_fds().size() > 0) {

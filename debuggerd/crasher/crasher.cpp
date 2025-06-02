@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
+#include <error.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -29,6 +30,9 @@
 #include <sys/prctl.h>
 #include <unistd.h>
 
+#include <android-base/file.h>
+#include <android-base/strings.h>
+
 // We test both kinds of logging.
 #include <android-base/logging.h>
 #include <log/log.h>
@@ -38,6 +42,8 @@
 #if defined(STATIC_CRASHER)
 #include "debuggerd/handler.h"
 #endif
+
+extern "C" void android_set_abort_message(const char* msg);
 
 #if defined(__arm__)
 // See https://www.kernel.org/doc/Documentation/arm/kernel_user_helpers.txt for details.
@@ -57,8 +63,10 @@ typedef int (__kuser_cmpxchg64_t)(const int64_t*, const int64_t*, volatile int64
 // Avoid name mangling so that stacks are more readable.
 extern "C" {
 
-void crash1(void);
-void crashnostack(void);
+void crash1();
+void crash_no_stack();
+void crash_bti();
+void crash_pac();
 
 int do_action(const char* arg);
 
@@ -134,15 +142,19 @@ noinline int crash(int a) {
     return a*2;
 }
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wfree-nonheap-object"
+
 noinline void abuse_heap() {
     char buf[16];
     free(buf); // GCC is smart enough to warn about this, but we're doing it deliberately.
 }
+#pragma clang diagnostic pop
 
 noinline void leak() {
     while (true) {
         void* mapping =
-            mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            mmap(nullptr, getpagesize(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         static_cast<volatile char*>(mapping)[0] = 'a';
     }
 }
@@ -153,11 +165,13 @@ noinline void sigsegv_non_null() {
 }
 
 noinline void fprintf_null() {
-    fprintf(nullptr, "oops");
+    FILE* sneaky_null = nullptr;
+    fprintf(sneaky_null, "oops");
 }
 
 noinline void readdir_null() {
-    readdir(nullptr);
+    DIR* sneaky_null = nullptr;
+    readdir(sneaky_null);
 }
 
 noinline int strlen_null() {
@@ -178,6 +192,8 @@ static int usage() {
     fprintf(stderr, "  leak                  leak memory until we get OOM-killed\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  abort                 call abort()\n");
+    fprintf(stderr, "  abort_with_msg        call abort() setting an abort message\n");
+    fprintf(stderr, "  abort_with_null_msg   call abort() setting a null abort message\n");
     fprintf(stderr, "  assert                call assert() without a function\n");
     fprintf(stderr, "  assert2               call assert() with a function\n");
     fprintf(stderr, "  exit                  call exit(1)\n");
@@ -186,14 +202,9 @@ static int usage() {
     fprintf(stderr, "  fdsan_file            close a file descriptor that's owned by a FILE*\n");
     fprintf(stderr, "  fdsan_dir             close a file descriptor that's owned by a DIR*\n");
     fprintf(stderr, "  seccomp               fail a seccomp check\n");
-#if defined(__arm__)
-    fprintf(stderr, "  kuser_helper_version  call kuser_helper_version\n");
-    fprintf(stderr, "  kuser_get_tls         call kuser_get_tls\n");
-    fprintf(stderr, "  kuser_cmpxchg         call kuser_cmpxchg\n");
-    fprintf(stderr, "  kuser_memory_barrier  call kuser_memory_barrier\n");
-    fprintf(stderr, "  kuser_cmpxchg64       call kuser_cmpxchg64\n");
-#endif
+#if defined(__LP64__)
     fprintf(stderr, "  xom                   read execute-only memory\n");
+#endif
     fprintf(stderr, "\n");
     fprintf(stderr, "  LOG_ALWAYS_FATAL      call liblog LOG_ALWAYS_FATAL\n");
     fprintf(stderr, "  LOG_ALWAYS_FATAL_IF   call liblog LOG_ALWAYS_FATAL_IF\n");
@@ -213,12 +224,41 @@ static int usage() {
     fprintf(stderr, "\n");
     fprintf(stderr, "  no_new_privs          set PR_SET_NO_NEW_PRIVS and then abort\n");
     fprintf(stderr, "\n");
+#if defined(__arm__)
+    fprintf(stderr, "Also, since this is an arm32 binary:\n");
+    fprintf(stderr, "  kuser_helper_version  call kuser_helper_version\n");
+    fprintf(stderr, "  kuser_get_tls         call kuser_get_tls\n");
+    fprintf(stderr, "  kuser_cmpxchg         call kuser_cmpxchg\n");
+    fprintf(stderr, "  kuser_memory_barrier  call kuser_memory_barrier\n");
+    fprintf(stderr, "  kuser_cmpxchg64       call kuser_cmpxchg64\n");
+#endif
+#if defined(__aarch64__)
+    fprintf(stderr, "Also, since this is an arm64 binary:\n");
+    fprintf(stderr, "  bti                   fail a branch target identification (BTI) check\n");
+    fprintf(stderr, "  pac                   fail a pointer authentication (PAC) check\n");
+#endif
+    fprintf(stderr, "\n");
     fprintf(stderr, "prefix any of the above with 'thread-' to run on a new thread\n");
     fprintf(stderr, "prefix any of the above with 'exhaustfd-' to exhaust\n");
     fprintf(stderr, "all available file descriptors before crashing.\n");
     fprintf(stderr, "prefix any of the above with 'wait-' to wait until input is received on stdin\n");
 
     return EXIT_FAILURE;
+}
+
+[[maybe_unused]] static void CheckCpuFeature(const std::string& name) {
+    std::string cpuinfo;
+    if (!android::base::ReadFileToString("/proc/cpuinfo", &cpuinfo)) {
+        error(1, errno, "couldn't read /proc/cpuinfo");
+    }
+    std::vector<std::string> lines = android::base::Split(cpuinfo, "\n");
+    for (std::string_view line : lines) {
+        if (!android::base::ConsumePrefix(&line, "Features\t:")) continue;
+        std::vector<std::string> features = android::base::Split(std::string(line), " ");
+        if (std::find(features.begin(), features.end(), name) == features.end()) {
+          error(1, 0, "/proc/cpuinfo does not report feature '%s'", name.c_str());
+        }
+    }
 }
 
 noinline int do_action(const char* arg) {
@@ -246,7 +286,7 @@ noinline int do_action(const char* arg) {
     } else if (!strcasecmp(arg, "stack-overflow")) {
       overflow_stack(nullptr);
     } else if (!strcasecmp(arg, "nostack")) {
-      crashnostack();
+      crash_no_stack();
     } else if (!strcasecmp(arg, "exit")) {
       exit(1);
     } else if (!strcasecmp(arg, "call-null")) {
@@ -254,6 +294,12 @@ noinline int do_action(const char* arg) {
     } else if (!strcasecmp(arg, "crash") || !strcmp(arg, "SIGSEGV")) {
       return crash(42);
     } else if (!strcasecmp(arg, "abort")) {
+      maybe_abort();
+    } else if (!strcasecmp(arg, "abort_with_msg")) {
+      android_set_abort_message("Aborting due to crasher");
+      maybe_abort();
+    } else if (!strcasecmp(arg, "abort_with_null")) {
+      android_set_abort_message(nullptr);
       maybe_abort();
     } else if (!strcasecmp(arg, "assert")) {
       __assert("some_file.c", 123, "false");
@@ -289,6 +335,8 @@ noinline int do_action(const char* arg) {
       __asm__ volatile(".word 0xe7f0def0\n");
 #elif defined(__i386__) || defined(__x86_64__)
       __asm__ volatile("ud2\n");
+#elif defined(__riscv)
+      __asm__ volatile("unimp\n");
 #else
 #error
 #endif
@@ -331,6 +379,14 @@ noinline int do_action(const char* arg) {
         __kuser_dmb();
     } else if (!strcasecmp(arg, "kuser_cmpxchg64")) {
         return __kuser_cmpxchg64(0, 0, 0);
+#endif
+#if defined(__aarch64__)
+    } else if (!strcasecmp(arg, "bti")) {
+        CheckCpuFeature("bti");
+        crash_bti();
+    } else if (!strcasecmp(arg, "pac")) {
+        CheckCpuFeature("paca");
+        crash_pac();
 #endif
     } else if (!strcasecmp(arg, "no_new_privs")) {
         if (prctl(PR_SET_NO_NEW_PRIVS, 1) != 0) {

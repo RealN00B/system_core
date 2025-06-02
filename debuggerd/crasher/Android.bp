@@ -13,20 +13,19 @@ cc_defaults {
         "-Werror",
         "-O0",
         "-fstack-protector-all",
-        "-Wno-free-nonheap-object",
         "-Wno-date-time",
     ],
+    tidy: false, // crasher.cpp tests many memory access errors
     srcs: ["crasher.cpp"],
     arch: {
         arm: {
             srcs: ["arm/crashglue.S"],
-
-            neon: {
-                asflags: ["-DHAS_VFP_D32"],
-            },
         },
         arm64: {
             srcs: ["arm64/crashglue.S"],
+        },
+        riscv64: {
+            srcs: ["riscv64/crashglue.S"],
         },
         x86: {
             srcs: ["x86/crashglue.S"],
@@ -46,6 +45,8 @@ cc_binary {
     shared_libs: [
         "libbase",
         "liblog",
+    ],
+    static_libs: [
         "libseccomp_policy",
     ],
     multilib: {

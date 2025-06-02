@@ -60,6 +60,7 @@ static_assert(sizeof(off_t) == sizeof(uint64_t));
 static inline void cleanup(const std::string& file_path, bool created) {
     if (created) {
         unlink(file_path.c_str());
+        sync();
     }
 }
 
@@ -458,9 +459,34 @@ static FiemapStatus AllocateFile(int file_fd, const std::string& file_path, uint
             return FiemapStatus::Error();
     }
 
-    if (fallocate(file_fd, 0, 0, file_size)) {
-        PLOG(ERROR) << "Failed to allocate space for file: " << file_path << " size: " << file_size;
-        return FiemapStatus::FromErrno(errno);
+    // F2FS can return EAGAIN and partially fallocate. Keep trying to fallocate,
+    // and if we don't make forward progress, return ENOSPC.
+    std::optional<off_t> prev_size;
+    while (true) {
+        if (fallocate(file_fd, 0, 0, file_size) == 0) {
+            break;
+        }
+        if (errno != EAGAIN) {
+            PLOG(ERROR) << "Failed to allocate space for file: " << file_path
+                        << " size: " << file_size;
+            return FiemapStatus::FromErrno(errno);
+        }
+
+        struct stat s;
+        if (fstat(file_fd, &s) < 0) {
+            PLOG(ERROR) << "Failed to fstat after fallocate failure: " << file_path;
+            return FiemapStatus::FromErrno(errno);
+        }
+        if (!prev_size) {
+            prev_size = {s.st_size};
+            continue;
+        }
+        if (*prev_size >= s.st_size) {
+            LOG(ERROR) << "Fallocate retry failed, got " << s.st_size << ", asked for "
+                       << file_size;
+            return FiemapStatus(FiemapStatus::ErrorCode::NO_SPACE);
+        }
+        LOG(INFO) << "Retrying fallocate, got " << s.st_size << ", asked for " << file_size;
     }
 
     if (need_explicit_writes) {
@@ -498,24 +524,6 @@ bool FiemapWriter::HasPinnedExtents(const std::string& file_path) {
     return IsFilePinned(fd, file_path, sfs.f_type);
 }
 
-static bool CountFiemapExtents(int file_fd, const std::string& file_path, uint32_t* num_extents) {
-    struct fiemap fiemap = {};
-    fiemap.fm_start = 0;
-    fiemap.fm_length = UINT64_MAX;
-    fiemap.fm_flags = FIEMAP_FLAG_SYNC;
-    fiemap.fm_extent_count = 0;
-
-    if (ioctl(file_fd, FS_IOC_FIEMAP, &fiemap)) {
-        PLOG(ERROR) << "Failed to get FIEMAP from the kernel for file: " << file_path;
-        return false;
-    }
-
-    if (num_extents) {
-        *num_extents = fiemap.fm_mapped_extents;
-    }
-    return true;
-}
-
 static bool IsValidExtent(const fiemap_extent* extent, std::string_view file_path) {
     if (extent->fe_flags & kUnsupportedExtentFlags) {
         LOG(ERROR) << "Extent at location " << extent->fe_logical << " of file " << file_path
@@ -530,12 +538,16 @@ static bool IsLastExtent(const fiemap_extent* extent) {
 }
 
 static bool FiemapToExtents(struct fiemap* fiemap, std::vector<struct fiemap_extent>* extents,
-                            uint32_t num_extents, std::string_view file_path) {
-    if (num_extents == 0) return false;
-
+                            std::string_view file_path) {
+    uint32_t num_extents = fiemap->fm_mapped_extents;
+    if (num_extents == 0) {
+        LOG(ERROR) << "File " << file_path << " has zero extent";
+        return false;
+    }
     const struct fiemap_extent* last_extent = &fiemap->fm_extents[num_extents - 1];
     if (!IsLastExtent(last_extent)) {
-        LOG(ERROR) << "FIEMAP did not return a final extent for file: " << file_path;
+        LOG(ERROR) << "FIEMAP did not return a final extent for file: " << file_path
+                   << " num_extents=" << num_extents << " max_extents=" << kMaxExtents;
         return false;
     }
 
@@ -577,21 +589,7 @@ static bool FiemapToExtents(struct fiemap* fiemap, std::vector<struct fiemap_ext
 
 static bool ReadFiemap(int file_fd, const std::string& file_path,
                        std::vector<struct fiemap_extent>* extents) {
-    uint32_t num_extents;
-    if (!CountFiemapExtents(file_fd, file_path, &num_extents)) {
-        return false;
-    }
-    if (num_extents == 0) {
-        LOG(ERROR) << "File " << file_path << " has zero extents";
-        return false;
-    }
-    if (num_extents > kMaxExtents) {
-        LOG(ERROR) << "File has " << num_extents << ", maximum is " << kMaxExtents << ": "
-                   << file_path;
-        return false;
-    }
-
-    uint64_t fiemap_size = sizeof(struct fiemap) + num_extents * sizeof(struct fiemap_extent);
+    uint64_t fiemap_size = sizeof(struct fiemap) + kMaxExtents * sizeof(struct fiemap_extent);
     auto buffer = std::unique_ptr<void, decltype(&free)>(calloc(1, fiemap_size), free);
     if (buffer == nullptr) {
         LOG(ERROR) << "Failed to allocate memory for fiemap";
@@ -603,19 +601,13 @@ static bool ReadFiemap(int file_fd, const std::string& file_path,
     fiemap->fm_length = UINT64_MAX;
     // make sure file is synced to disk before we read the fiemap
     fiemap->fm_flags = FIEMAP_FLAG_SYNC;
-    fiemap->fm_extent_count = num_extents;
+    fiemap->fm_extent_count = kMaxExtents;
 
     if (ioctl(file_fd, FS_IOC_FIEMAP, fiemap)) {
         PLOG(ERROR) << "Failed to get FIEMAP from the kernel for file: " << file_path;
         return false;
     }
-    if (fiemap->fm_mapped_extents != num_extents) {
-        LOG(ERROR) << "FIEMAP returned unexpected extent count (" << num_extents
-                   << " expected, got " << fiemap->fm_mapped_extents << ") for file: " << file_path;
-        return false;
-    }
-
-    return FiemapToExtents(fiemap, extents, num_extents, file_path);
+    return FiemapToExtents(fiemap, extents, file_path);
 }
 
 static bool ReadFibmap(int file_fd, const std::string& file_path,

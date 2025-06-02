@@ -131,22 +131,35 @@ bool OptimizeSourceCopyOperation(const InstallOperation& operation, InstallOpera
     return is_optimized;
 }
 
-void WriteExtent(DmSnapCowSizeCalculator* sc, const chromeos_update_engine::Extent& de,
+bool WriteExtent(DmSnapCowSizeCalculator* sc, const chromeos_update_engine::Extent& de,
                  unsigned int sectors_per_block) {
     const auto block_boundary = de.start_block() + de.num_blocks();
     for (auto b = de.start_block(); b < block_boundary; ++b) {
         for (unsigned int s = 0; s < sectors_per_block; ++s) {
-            const auto sector_id = b * sectors_per_block + s;
+            // sector_id = b * sectors_per_block + s;
+            uint64_t block_start_sector_id;
+            if (__builtin_mul_overflow(b, sectors_per_block, &block_start_sector_id)) {
+                LOG(ERROR) << "Integer overflow when calculating sector id (" << b << " * "
+                           << sectors_per_block << ")";
+                return false;
+            }
+            uint64_t sector_id;
+            if (__builtin_add_overflow(block_start_sector_id, s, &sector_id)) {
+                LOG(ERROR) << "Integer overflow when calculating sector id ("
+                           << block_start_sector_id << " + " << s << ")";
+                return false;
+            }
             sc->WriteSector(sector_id);
         }
     }
+    return true;
 }
 
-uint64_t PartitionCowCreator::GetCowSize() {
-    if (compression_enabled) {
+std::optional<uint64_t> PartitionCowCreator::GetCowSize() {
+    if (using_snapuserd) {
         if (update == nullptr || !update->has_estimate_cow_size()) {
             LOG(ERROR) << "Update manifest does not include a COW size";
-            return 0;
+            return std::nullopt;
         }
 
         // Add an extra 2MB of wiggle room for any minor differences in labels/metadata
@@ -167,7 +180,7 @@ uint64_t PartitionCowCreator::GetCowSize() {
     // Allocate space for extra extents (if any). These extents are those that can be
     // used for error corrections or to store verity hash trees.
     for (const auto& de : extra_extents) {
-        WriteExtent(&sc, de, sectors_per_block);
+        if (!WriteExtent(&sc, de, sectors_per_block)) return std::nullopt;
     }
 
     if (update == nullptr) return sc.cow_size_bytes();
@@ -182,7 +195,7 @@ uint64_t PartitionCowCreator::GetCowSize() {
         }
 
         for (const auto& de : written_op->dst_extents()) {
-            WriteExtent(&sc, de, sectors_per_block);
+            if (!WriteExtent(&sc, de, sectors_per_block)) return std::nullopt;
         }
     }
 
@@ -201,6 +214,11 @@ std::optional<PartitionCowCreator::Return> PartitionCowCreator::Run() {
     ret.snapshot_status.set_name(target_partition->name());
     ret.snapshot_status.set_device_size(target_partition->size());
     ret.snapshot_status.set_snapshot_size(target_partition->size());
+
+    if (update && update->has_estimate_cow_size()) {
+        ret.snapshot_status.set_estimated_cow_size(update->estimate_cow_size());
+        ret.snapshot_status.set_estimated_ops_buffer_size(update->estimate_op_count_max());
+    }
 
     if (ret.snapshot_status.snapshot_size() == 0) {
         LOG(INFO) << "Not creating snapshot for partition " << ret.snapshot_status.name();
@@ -239,7 +257,7 @@ std::optional<PartitionCowCreator::Return> PartitionCowCreator::Run() {
     }
 
     // Compute the COW partition size.
-    uint64_t cow_partition_size = std::min(cow_size, free_region_length);
+    uint64_t cow_partition_size = std::min(cow_size.value(), free_region_length);
     // Round it down to the nearest logical block. Logical partitions must be a multiple
     // of logical blocks.
     cow_partition_size &= ~(logical_block_size - 1);
@@ -247,7 +265,7 @@ std::optional<PartitionCowCreator::Return> PartitionCowCreator::Run() {
     // Assign cow_partition_usable_regions to indicate what regions should the COW partition uses.
     ret.cow_partition_usable_regions = std::move(free_regions);
 
-    auto cow_file_size = cow_size - cow_partition_size;
+    auto cow_file_size = cow_size.value() - cow_partition_size;
     // Round it up to the nearest sector.
     cow_file_size += kSectorSize - 1;
     cow_file_size &= ~(kSectorSize - 1);

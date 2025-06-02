@@ -15,13 +15,17 @@
 //
 
 package {
+    default_team: "trendy_team_android_kernel",
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
 cc_library_headers {
     name: "libfiemap_headers",
+    ramdisk_available: true,
+    vendor_ramdisk_available: true,
     recovery_available: true,
     export_include_dirs: ["include"],
+    host_supported: true,
 }
 
 filegroup {
@@ -88,7 +92,12 @@ cc_test {
 
     test_suites: ["vts", "device-tests"],
     auto_gen_config: true,
-    test_min_api_level: 29,
+    test_options: {
+        min_shipping_api_level: 29,
+    },
+    header_libs: [
+        "libstorage_literals_headers",
+    ],
     require_root: true,
 }
 

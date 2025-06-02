@@ -36,8 +36,7 @@
 #include <log/log_properties.h>
 
 #if defined(__BIONIC__)
-#define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
-#include <sys/_system_properties.h>
+#include <sys/system_properties.h>
 #endif
 
 /**
@@ -49,17 +48,17 @@
 
 constexpr uint32_t kSeqNoNotInit = static_cast<uint32_t>(-1);
 
-atomic_bool              atrace_is_ready      = ATOMIC_VAR_INIT(false);
+atomic_bool              atrace_is_ready      = false;
 int                      atrace_marker_fd     = -1;
 uint64_t                 atrace_enabled_tags  = ATRACE_TAG_NOT_READY;
-static atomic_bool       atrace_is_enabled    = ATOMIC_VAR_INIT(true);
+static atomic_bool       atrace_is_enabled    = true;
 static pthread_mutex_t   atrace_tags_mutex    = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * Sequence number of debug.atrace.tags.enableflags the last time the enabled
  * tags were reloaded.
  **/
-static _Atomic(uint32_t) last_sequence_number = ATOMIC_VAR_INIT(kSeqNoNotInit);
+static _Atomic(uint32_t) last_sequence_number = kSeqNoNotInit;
 
 #if defined(__BIONIC__)
 // All zero prop_info that has a sequence number of 0. This is easier than
@@ -185,21 +184,36 @@ void atrace_update_tags()
     }
 }
 
-#define WRITE_MSG(format_begin, format_end, name, value) { \
+#define WRITE_MSG(format_begin, format_end, track_name, name, value) { \
     char buf[ATRACE_MESSAGE_LENGTH] __attribute__((uninitialized));     \
+    const char* track_name_sep = track_name[0] != '\0' ? "|" : ""; \
     int pid = getpid(); \
-    int len = snprintf(buf, sizeof(buf), format_begin "%s" format_end, pid, \
-        name, value); \
+    int len = snprintf(buf, sizeof(buf), format_begin "%s%s%s" format_end, pid, \
+        track_name, track_name_sep, name, value); \
     if (len >= (int) sizeof(buf)) { \
-        /* Given the sizeof(buf), and all of the current format buffers, \
-         * it is impossible for name_len to be < 0 if len >= sizeof(buf). */ \
         int name_len = strlen(name) - (len - sizeof(buf)) - 1; \
         /* Truncate the name to make the message fit. */ \
-        ALOGW("Truncated name in %s: %s\n", __FUNCTION__, name); \
-        len = snprintf(buf, sizeof(buf), format_begin "%.*s" format_end, pid, \
-            name_len, name, value); \
+        if (name_len > 0) { \
+            len = snprintf(buf, sizeof(buf), format_begin "%s%s%.*s" format_end, pid, \
+                track_name, track_name_sep, name_len, name, value); \
+        } else { \
+            int track_name_len = 0; \
+            if (track_name[0] != '\0') { \
+                track_name_len = strlen(track_name) - (len - strlen(name) - sizeof(buf)) - 2; \
+            } \
+            if (track_name_len <= 0) { \
+                /* Data is still too long. Drop it. */ \
+                len = 0; \
+            } else { \
+                /* Truncate the trackName and name to make the message fit */ \
+                len = snprintf(buf, sizeof(buf), format_begin "%.*s|%.1s" format_end, pid, \
+                    track_name_len, track_name, name, value); \
+            } \
+        } \
     } \
-    write(atrace_marker_fd, buf, len); \
+    if (len > 0) { \
+        write(atrace_marker_fd, buf, len); \
+    } \
 }
 
 #endif  // __TRACE_DEV_INC

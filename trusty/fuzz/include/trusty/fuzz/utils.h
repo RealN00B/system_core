@@ -21,7 +21,7 @@
 #include <android-base/result.h>
 #include <android-base/unique_fd.h>
 
-#define TIPC_MAX_MSG_SIZE PAGE_SIZE
+#define TIPC_MAX_MSG_SIZE 4096
 
 namespace android {
 namespace trusty {
@@ -34,6 +34,7 @@ class TrustyApp {
     android::base::Result<void> Connect();
     android::base::Result<void> Read(void* buf, size_t len);
     android::base::Result<void> Write(const void* buf, size_t len);
+    void Disconnect();
 
     android::base::Result<int> GetRawFd();
 

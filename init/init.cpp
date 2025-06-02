@@ -26,13 +26,15 @@
 #include <sys/eventfd.h>
 #include <sys/mount.h>
 #include <sys/signalfd.h>
+#include <sys/system_properties.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
-#define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
-#include <sys/_system_properties.h>
-
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -47,19 +49,22 @@
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
-#include <backtrace/Backtrace.h>
+#include <android-base/thread_annotations.h>
 #include <fs_avb/fs_avb.h>
 #include <fs_mgr_vendor_overlay.h>
-#include <keyutils.h>
 #include <libavb/libavb.h>
 #include <libgsi/libgsi.h>
 #include <libsnapshot/snapshot.h>
+#include <logwrap/logwrap.h>
 #include <processgroup/processgroup.h>
 #include <processgroup/setup.h>
 #include <selinux/android.h>
+#include <unwindstack/AndroidUnwinder.h>
 
+#include "action.h"
+#include "action_manager.h"
 #include "action_parser.h"
-#include "builtins.h"
+#include "apex_init_util.h"
 #include "epoll.h"
 #include "first_stage_init.h"
 #include "first_stage_mount.h"
@@ -77,12 +82,17 @@
 #include "selabel.h"
 #include "selinux.h"
 #include "service.h"
+#include "service_list.h"
 #include "service_parser.h"
 #include "sigchld_handler.h"
 #include "snapuserd_transition.h"
 #include "subcontext.h"
 #include "system/core/init/property_service.pb.h"
 #include "util.h"
+
+#ifndef RECOVERY
+#include "com_android_apex.h"
+#endif  // RECOVERY
 
 using namespace std::chrono_literals;
 using namespace std::string_literals;
@@ -95,6 +105,7 @@ using android::base::SetProperty;
 using android::base::StringPrintf;
 using android::base::Timer;
 using android::base::Trim;
+using android::base::unique_fd;
 using android::fs_mgr::AvbHandle;
 using android::snapshot::SnapshotManager;
 
@@ -103,7 +114,7 @@ namespace init {
 
 static int property_triggers_enabled = 0;
 
-static int signal_fd = -1;
+static int sigterm_fd = -1;
 static int property_fd = -1;
 
 struct PendingControlMessage {
@@ -199,16 +210,16 @@ static class PropWaiterState {
     }
 
   private:
-    void ResetWaitForPropLocked() {
+    void ResetWaitForPropLocked() EXCLUSIVE_LOCKS_REQUIRED(lock_) {
         wait_prop_name_.clear();
         wait_prop_value_.clear();
         waiting_for_prop_.reset();
     }
 
     std::mutex lock_;
-    std::unique_ptr<Timer> waiting_for_prop_{nullptr};
-    std::string wait_prop_name_;
-    std::string wait_prop_value_;
+    GUARDED_BY(lock_) std::unique_ptr<Timer> waiting_for_prop_{nullptr};
+    GUARDED_BY(lock_) std::string wait_prop_name_;
+    GUARDED_BY(lock_) std::string wait_prop_value_;
 
 } prop_waiter_state;
 
@@ -234,45 +245,20 @@ static class ShutdownState {
         WakeMainInitThread();
     }
 
-    std::optional<std::string> CheckShutdown() {
+    std::optional<std::string> CheckShutdown() __attribute__((warn_unused_result)) {
         auto lock = std::lock_guard{shutdown_command_lock_};
         if (do_shutdown_ && !IsShuttingDown()) {
+            do_shutdown_ = false;
             return shutdown_command_;
         }
         return {};
     }
 
-    bool do_shutdown() const { return do_shutdown_; }
-    void set_do_shutdown(bool value) { do_shutdown_ = value; }
-
   private:
     std::mutex shutdown_command_lock_;
-    std::string shutdown_command_;
+    std::string shutdown_command_ GUARDED_BY(shutdown_command_lock_);
     bool do_shutdown_ = false;
 } shutdown_state;
-
-static void UnwindMainThreadStack() {
-    std::unique_ptr<Backtrace> backtrace(Backtrace::Create(BACKTRACE_CURRENT_PROCESS, 1));
-    if (!backtrace->Unwind(0)) {
-        LOG(ERROR) << __FUNCTION__ << "sys.powerctl: Failed to unwind callstack.";
-    }
-    for (size_t i = 0; i < backtrace->NumFrames(); i++) {
-        LOG(ERROR) << "sys.powerctl: " << backtrace->FormatFrameData(i);
-    }
-}
-
-void DebugRebootLogging() {
-    LOG(INFO) << "sys.powerctl: do_shutdown: " << shutdown_state.do_shutdown()
-              << " IsShuttingDown: " << IsShuttingDown();
-    if (shutdown_state.do_shutdown()) {
-        LOG(ERROR) << "sys.powerctl set while a previous shutdown command has not been handled";
-        UnwindMainThreadStack();
-    }
-    if (IsShuttingDown()) {
-        LOG(ERROR) << "sys.powerctl set while init is already shutting down";
-        UnwindMainThreadStack();
-    }
-}
 
 void DumpState() {
     ServiceList::GetInstance().DumpState();
@@ -282,21 +268,64 @@ void DumpState() {
 Parser CreateParser(ActionManager& action_manager, ServiceList& service_list) {
     Parser parser;
 
-    parser.AddSectionParser("service", std::make_unique<ServiceParser>(
-                                               &service_list, GetSubcontext(), std::nullopt));
+    parser.AddSectionParser("service",
+                            std::make_unique<ServiceParser>(&service_list, GetSubcontext()));
     parser.AddSectionParser("on", std::make_unique<ActionParser>(&action_manager, GetSubcontext()));
     parser.AddSectionParser("import", std::make_unique<ImportParser>(&parser));
 
     return parser;
 }
 
-// parser that only accepts new services
-Parser CreateServiceOnlyParser(ServiceList& service_list, bool from_apex) {
-    Parser parser;
+#ifndef RECOVERY
+template <typename T>
+struct LibXmlErrorHandler {
+    T handler_;
+    template <typename Handler>
+    LibXmlErrorHandler(Handler&& handler) : handler_(std::move(handler)) {
+        xmlSetGenericErrorFunc(nullptr, &ErrorHandler);
+    }
+    ~LibXmlErrorHandler() { xmlSetGenericErrorFunc(nullptr, nullptr); }
+    static void ErrorHandler(void*, const char* msg, ...) {
+        va_list args;
+        va_start(args, msg);
+        char* formatted;
+        if (vasprintf(&formatted, msg, args) >= 0) {
+            LOG(ERROR) << formatted;
+        }
+        free(formatted);
+        va_end(args);
+    }
+};
 
-    parser.AddSectionParser(
-            "service", std::make_unique<ServiceParser>(&service_list, GetSubcontext(), std::nullopt,
-                                                       from_apex));
+template <typename Handler>
+LibXmlErrorHandler(Handler&&) -> LibXmlErrorHandler<Handler>;
+#endif  // RECOVERY
+
+// Returns a Parser that accepts scripts from APEX modules. It supports `service` and `on`.
+Parser CreateApexConfigParser(ActionManager& action_manager, ServiceList& service_list) {
+    Parser parser;
+    auto subcontext = GetSubcontext();
+#ifndef RECOVERY
+    if (subcontext) {
+        const auto apex_info_list_file = "/apex/apex-info-list.xml";
+        auto error_handler = LibXmlErrorHandler([&](const auto& error_message) {
+            LOG(ERROR) << "Failed to read " << apex_info_list_file << ":" << error_message;
+        });
+        const auto apex_info_list = com::android::apex::readApexInfoList(apex_info_list_file);
+        if (apex_info_list.has_value()) {
+            std::vector<std::string> subcontext_apexes;
+            for (const auto& info : apex_info_list->getApexInfo()) {
+                if (subcontext->PartitionMatchesSubcontext(info.getPartition())) {
+                    subcontext_apexes.push_back(info.getModuleName());
+                }
+            }
+            subcontext->SetApexList(std::move(subcontext_apexes));
+        }
+    }
+#endif  // RECOVERY
+    parser.AddSectionParser("service", std::make_unique<ServiceParser>(&service_list, subcontext));
+    parser.AddSectionParser("on", std::make_unique<ActionParser>(&action_manager, subcontext));
+
     return parser;
 }
 
@@ -389,6 +418,81 @@ static Result<void> DoControlRestart(Service* service) {
     return {};
 }
 
+int StopServicesFromApex(const std::string& apex_name) {
+    auto services = ServiceList::GetInstance().FindServicesByApexName(apex_name);
+    if (services.empty()) {
+        LOG(INFO) << "No service found for APEX: " << apex_name;
+        return 0;
+    }
+    std::set<std::string> service_names;
+    for (const auto& service : services) {
+        service_names.emplace(service->name());
+    }
+    constexpr std::chrono::milliseconds kServiceStopTimeout = 10s;
+    int still_running = StopServicesAndLogViolations(service_names, kServiceStopTimeout,
+                        true /*SIGTERM*/);
+    // Send SIGKILL to ones that didn't terminate cleanly.
+    if (still_running > 0) {
+        still_running = StopServicesAndLogViolations(service_names, 0ms, false /*SIGKILL*/);
+    }
+    return still_running;
+}
+
+void RemoveServiceAndActionFromApex(const std::string& apex_name) {
+    // Remove services and actions that match apex name
+    ActionManager::GetInstance().RemoveActionIf([&](const std::unique_ptr<Action>& action) -> bool {
+        if (GetApexNameFromFileName(action->filename()) == apex_name) {
+            return true;
+        }
+        return false;
+    });
+    ServiceList::GetInstance().RemoveServiceIf([&](const std::unique_ptr<Service>& s) -> bool {
+        if (GetApexNameFromFileName(s->filename()) == apex_name) {
+            return true;
+        }
+        return false;
+    });
+}
+
+static Result<void> DoUnloadApex(const std::string& apex_name) {
+    if (StopServicesFromApex(apex_name) > 0) {
+        return Error() << "Unable to stop all service from " << apex_name;
+    }
+    RemoveServiceAndActionFromApex(apex_name);
+    return {};
+}
+
+static Result<void> UpdateApexLinkerConfig(const std::string& apex_name) {
+    // Do not invoke linkerconfig when there's no bin/ in the apex.
+    const std::string bin_path = "/apex/" + apex_name + "/bin";
+    if (access(bin_path.c_str(), R_OK) != 0) {
+        return {};
+    }
+    const char* linkerconfig_binary = "/apex/com.android.runtime/bin/linkerconfig";
+    const char* linkerconfig_target = "/linkerconfig";
+    const char* arguments[] = {linkerconfig_binary, "--target", linkerconfig_target, "--apex",
+                               apex_name.c_str(),   "--strict"};
+
+    if (logwrap_fork_execvp(arraysize(arguments), arguments, nullptr, false, LOG_KLOG, false,
+                            nullptr) != 0) {
+        return ErrnoError() << "failed to execute linkerconfig";
+    }
+    LOG(INFO) << "Generated linker configuration for " << apex_name;
+    return {};
+}
+
+static Result<void> DoLoadApex(const std::string& apex_name) {
+    if (auto result = ParseRcScriptsFromApex(apex_name); !result.ok()) {
+        return result.error();
+    }
+
+    if (auto result = UpdateApexLinkerConfig(apex_name); !result.ok()) {
+        return result.error();
+    }
+
+    return {};
+}
+
 enum class ControlTarget {
     SERVICE,    // function gets called for the named service
     INTERFACE,  // action gets called for every service that holds this interface
@@ -412,6 +516,17 @@ static const std::map<std::string, ControlMessageFunction, std::less<>>& GetCont
     return control_message_functions;
 }
 
+static Result<void> HandleApexControlMessage(std::string_view action, const std::string& name,
+                                             std::string_view message) {
+    if (action == "load") {
+        return DoLoadApex(name);
+    } else if (action == "unload") {
+        return DoUnloadApex(name);
+    } else {
+        return Error() << "Unknown control msg '" << message << "'";
+    }
+}
+
 static bool HandleControlMessage(std::string_view message, const std::string& name,
                                  pid_t from_pid) {
     std::string cmdline_path = StringPrintf("proc/%d/cmdline", from_pid);
@@ -423,8 +538,20 @@ static bool HandleControlMessage(std::string_view message, const std::string& na
         process_cmdline = "unknown process";
     }
 
-    Service* service = nullptr;
     auto action = message;
+    if (ConsumePrefix(&action, "apex_")) {
+        if (auto result = HandleApexControlMessage(action, name, message); !result.ok()) {
+            LOG(ERROR) << "Control message: Could not ctl." << message << " for '" << name
+                       << "' from pid: " << from_pid << " (" << process_cmdline
+                       << "): " << result.error();
+            return false;
+        }
+        LOG(INFO) << "Control message: Processed ctl." << message << " for '" << name
+                  << "' from pid: " << from_pid << " (" << process_cmdline << ")";
+        return true;
+    }
+
+    Service* service = nullptr;
     if (ConsumePrefix(&action, "interface_")) {
         service = ServiceList::GetInstance().FindInterface(name);
     } else {
@@ -504,9 +631,10 @@ static Result<void> wait_for_coldboot_done_action(const BuiltinArguments& args) 
 }
 
 static Result<void> SetupCgroupsAction(const BuiltinArguments&) {
-    // Have to create <CGROUPS_RC_DIR> using make_dir function
-    // for appropriate sepolicy to be set for it
-    make_dir(android::base::Dirname(CGROUPS_RC_PATH), 0711);
+    if (!CgroupsAvailable()) {
+        LOG(INFO) << "Cgroups support in kernel is not enabled";
+        return {};
+    }
     if (!CgroupSetup()) {
         return ErrnoError() << "Failed to setup cgroups";
     }
@@ -518,11 +646,9 @@ static void export_oem_lock_status() {
     if (!android::base::GetBoolProperty("ro.oem_unlock_supported", false)) {
         return;
     }
-    ImportKernelCmdline([](const std::string& key, const std::string& value) {
-        if (key == "androidboot.verifiedbootstate") {
-            SetProperty("ro.boot.flash.locked", value == "orange" ? "0" : "1");
-        }
-    });
+    SetProperty(
+            "ro.boot.flash.locked",
+            android::base::GetProperty("ro.boot.verifiedbootstate", "") == "orange" ? "0" : "1");
 }
 
 static Result<void> property_enable_triggers_action(const BuiltinArguments& args) {
@@ -556,6 +682,19 @@ static void SetUsbController() {
     }
 }
 
+/// Set ro.kernel.version property to contain the major.minor pair as returned
+/// by uname(2).
+static void SetKernelVersion() {
+    struct utsname uts;
+    unsigned int major, minor;
+
+    if ((uname(&uts) != 0) || (sscanf(uts.release, "%u.%u", &major, &minor) != 2)) {
+        LOG(ERROR) << "Could not parse the kernel version from uname";
+        return;
+    }
+    SetProperty("ro.kernel.version", android::base::StringPrintf("%u.%u", major, minor));
+}
+
 static void HandleSigtermSignal(const signalfd_siginfo& siginfo) {
     if (siginfo.ssi_pid != 0) {
         // Drop any userspace SIGTERM requests.
@@ -566,8 +705,9 @@ static void HandleSigtermSignal(const signalfd_siginfo& siginfo) {
     HandlePowerctlMessage("shutdown,container");
 }
 
-static void HandleSignalFd() {
+static void HandleSignalFd(int signal) {
     signalfd_siginfo siginfo;
+    const int signal_fd = signal == SIGCHLD ? Service::GetSigchldFd() : sigterm_fd;
     ssize_t bytes_read = TEMP_FAILURE_RETRY(read(signal_fd, &siginfo, sizeof(siginfo)));
     if (bytes_read != sizeof(siginfo)) {
         PLOG(ERROR) << "Failed to read siginfo from signal_fd";
@@ -582,7 +722,7 @@ static void HandleSignalFd() {
             HandleSigtermSignal(siginfo);
             break;
         default:
-            PLOG(ERROR) << "signal_fd: received unexpected signal " << siginfo.ssi_signo;
+            LOG(ERROR) << "signal_fd: received unexpected signal " << siginfo.ssi_signo;
             break;
     }
 }
@@ -601,25 +741,33 @@ static void UnblockSignals() {
     }
 }
 
+static Result<void> RegisterSignalFd(Epoll* epoll, int signal, int fd) {
+    return epoll->RegisterHandler(
+            fd, [signal]() { HandleSignalFd(signal); }, EPOLLIN | EPOLLPRI);
+}
+
+static Result<int> CreateAndRegisterSignalFd(Epoll* epoll, int signal) {
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, signal);
+    if (sigprocmask(SIG_BLOCK, &mask, nullptr) == -1) {
+        return ErrnoError() << "failed to block signal " << signal;
+    }
+
+    unique_fd signal_fd(signalfd(-1, &mask, SFD_CLOEXEC));
+    if (signal_fd.get() < 0) {
+        return ErrnoError() << "failed to create signalfd for signal " << signal;
+    }
+    OR_RETURN(RegisterSignalFd(epoll, signal, signal_fd.get()));
+
+    return signal_fd.release();
+}
+
 static void InstallSignalFdHandler(Epoll* epoll) {
     // Applying SA_NOCLDSTOP to a defaulted SIGCHLD handler prevents the signalfd from receiving
     // SIGCHLD when a child process stops or continues (b/77867680#comment9).
-    const struct sigaction act { .sa_handler = SIG_DFL, .sa_flags = SA_NOCLDSTOP };
+    const struct sigaction act { .sa_flags = SA_NOCLDSTOP, .sa_handler = SIG_DFL };
     sigaction(SIGCHLD, &act, nullptr);
-
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGCHLD);
-
-    if (!IsRebootCapable()) {
-        // If init does not have the CAP_SYS_BOOT capability, it is running in a container.
-        // In that case, receiving SIGTERM will cause the system to shut down.
-        sigaddset(&mask, SIGTERM);
-    }
-
-    if (sigprocmask(SIG_BLOCK, &mask, nullptr) == -1) {
-        PLOG(FATAL) << "failed to block signals";
-    }
 
     // Register a handler to unblock signals in the child processes.
     const int result = pthread_atfork(nullptr, nullptr, &UnblockSignals);
@@ -627,13 +775,17 @@ static void InstallSignalFdHandler(Epoll* epoll) {
         LOG(FATAL) << "Failed to register a fork handler: " << strerror(result);
     }
 
-    signal_fd = signalfd(-1, &mask, SFD_CLOEXEC);
-    if (signal_fd == -1) {
-        PLOG(FATAL) << "failed to create signalfd";
+    Result<void> cs_result = RegisterSignalFd(epoll, SIGCHLD, Service::GetSigchldFd());
+    if (!cs_result.ok()) {
+        PLOG(FATAL) << cs_result.error();
     }
 
-    if (auto result = epoll->RegisterHandler(signal_fd, HandleSignalFd); !result.ok()) {
-        LOG(FATAL) << result.error();
+    if (!IsRebootCapable()) {
+        Result<int> cs_result = CreateAndRegisterSignalFd(epoll, SIGTERM);
+        if (!cs_result.ok()) {
+            PLOG(FATAL) << cs_result.error();
+        }
+        sigterm_fd = cs_result.value();
     }
 }
 
@@ -684,6 +836,12 @@ static void MountExtraFilesystems() {
     CHECKCALL(mount("tmpfs", "/apex", "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV,
                     "mode=0755,uid=0,gid=0"));
 
+    if (NeedsTwoMountNamespaces()) {
+        // /bootstrap-apex is used to mount "bootstrap" APEXes.
+        CHECKCALL(mount("tmpfs", "/bootstrap-apex", "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV,
+                        "mode=0755,uid=0,gid=0"));
+    }
+
     // /linkerconfig is used to keep generated linker configuration
     CHECKCALL(mount("tmpfs", "/linkerconfig", "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV,
                     "mode=0755,uid=0,gid=0"));
@@ -713,6 +871,10 @@ static void RecordStageBoottimes(const boot_clock::time_point& second_stage_star
     SetProperty("ro.boottime.init.selinux",
                 std::to_string(second_stage_start_time.time_since_epoch().count() -
                                selinux_start_time_ns));
+    if (auto init_module_time_str = getenv(kEnvInitModuleDurationMs); init_module_time_str) {
+        SetProperty("ro.boottime.init.modules", init_module_time_str);
+        unsetenv(kEnvInitModuleDurationMs);
+    }
 }
 
 void SendLoadPersistentPropertiesMessage() {
@@ -723,11 +885,49 @@ void SendLoadPersistentPropertiesMessage() {
     }
 }
 
+static Result<void> ConnectEarlyStageSnapuserdAction(const BuiltinArguments& args) {
+    auto pid = GetSnapuserdFirstStagePid();
+    if (!pid) {
+        return {};
+    }
+
+    auto info = GetSnapuserdFirstStageInfo();
+    if (auto iter = std::find(info.begin(), info.end(), "socket"s); iter == info.end()) {
+        // snapuserd does not support socket handoff, so exit early.
+        return {};
+    }
+
+    // Socket handoff is supported.
+    auto svc = ServiceList::GetInstance().FindService("snapuserd");
+    if (!svc) {
+        LOG(FATAL) << "Failed to find snapuserd service entry";
+    }
+
+    svc->SetShutdownCritical();
+    svc->SetStartedInFirstStage(*pid);
+
+    svc = ServiceList::GetInstance().FindService("snapuserd_proxy");
+    if (!svc) {
+        LOG(FATAL) << "Failed find snapuserd_proxy service entry, merge will never initiate";
+    }
+    if (!svc->MarkSocketPersistent("snapuserd")) {
+        LOG(FATAL) << "Could not find snapuserd socket in snapuserd_proxy service entry";
+    }
+    if (auto result = svc->Start(); !result.ok()) {
+        LOG(FATAL) << "Could not start snapuserd_proxy: " << result.error();
+    }
+    return {};
+}
+
 int SecondStageMain(int argc, char** argv) {
     if (REBOOT_BOOTLOADER_ON_PANIC) {
         InstallRebootSignalHandlers();
     }
 
+    // No threads should be spin up until signalfd
+    // is registered. If the threads are indeed required,
+    // each of these threads _should_ make sure SIGCHLD signal
+    // is blocked. See b/223076262
     boot_clock::time_point start_time = boot_clock::now();
 
     trigger_shutdown = [](const std::string& command) { shutdown_state.TriggerShutdown(command); };
@@ -735,6 +935,8 @@ int SecondStageMain(int argc, char** argv) {
     SetStdioToDevNull(argv);
     InitKernelLogging(argv);
     LOG(INFO) << "init second stage started!";
+
+    SelinuxSetupKernelLogging();
 
     // Update $PATH in the case the second stage init is newer than first stage init, where it is
     // first set.
@@ -759,11 +961,6 @@ int SecondStageMain(int argc, char** argv) {
         LOG(ERROR) << "Unable to write " << DEFAULT_OOM_SCORE_ADJUST
                    << " to /proc/1/oom_score_adj: " << result.error();
     }
-
-    // Set up a session keyring that all processes will have access to. It
-    // will hold things like FBE encryption keys. No process should override
-    // its session keyring.
-    keyctl_get_keyring_ID(KEY_SPEC_SESSION_KEYRING, 1);
 
     // Indicate that booting is in progress to background fw loaders, etc.
     close(open("/dev/.booting", O_WRONLY | O_CREAT | O_CLOEXEC, 0000));
@@ -796,7 +993,6 @@ int SecondStageMain(int argc, char** argv) {
     MountExtraFilesystems();
 
     // Now set up SELinux for second stage.
-    SelinuxSetupKernelLogging();
     SelabelInitialize();
     SelinuxRestoreContext();
 
@@ -804,6 +1000,11 @@ int SecondStageMain(int argc, char** argv) {
     if (auto result = epoll.Open(); !result.ok()) {
         PLOG(FATAL) << result.error();
     }
+
+    // We always reap children before responding to the other pending functions. This is to
+    // prevent a race where other daemons see that a service has exited and ask init to
+    // start it again via ctl.start before init has reaped it.
+    epoll.SetFirstCallback(ReapAnyOutstandingChildren);
 
     InstallSignalFdHandler(&epoll);
     InstallInitNotifier(&epoll);
@@ -822,6 +1023,7 @@ int SecondStageMain(int argc, char** argv) {
     export_oem_lock_status();
     MountHandler mount_handler(&epoll);
     SetUsbController();
+    SetKernelVersion();
 
     const BuiltinFunctionMap& function_map = GetBuiltinFunctionMap();
     Action::set_function_map(&function_map);
@@ -846,26 +1048,18 @@ int SecondStageMain(int argc, char** argv) {
     SetProperty(gsi::kGsiBootedProp, is_running);
     auto is_installed = android::gsi::IsGsiInstalled() ? "1" : "0";
     SetProperty(gsi::kGsiInstalledProp, is_installed);
-
-    /*
-     * For debug builds of S launching devices, init mounts debugfs for
-     * enabling vendor debug data collection setup at boot time. Init will unmount it on
-     * boot-complete after vendor code has performed the required initializations
-     * during boot. Dumpstate will then mount debugfs in order to read data
-     * from the same using the dumpstate HAL during bugreport creation.
-     * Dumpstate will also unmount debugfs after bugreport creation.
-     * first_api_level comparison is done here instead
-     * of init.rc since init.rc parser does not support >/< operators.
-     */
-    auto api_level = android::base::GetIntProperty("ro.product.first_api_level", 0);
-    bool is_debuggable = android::base::GetBoolProperty("ro.debuggable", false);
-    auto mount_debugfs = (is_debuggable && (api_level >= 31)) ? "1" : "0";
-    SetProperty("init.mount_debugfs", mount_debugfs);
+    if (android::gsi::IsGsiRunning()) {
+        std::string dsu_slot;
+        if (android::gsi::GetActiveDsu(&dsu_slot)) {
+            SetProperty(gsi::kDsuSlotProp, dsu_slot);
+        }
+    }
 
     am.QueueBuiltinAction(SetupCgroupsAction, "SetupCgroups");
     am.QueueBuiltinAction(SetKptrRestrictAction, "SetKptrRestrict");
     am.QueueBuiltinAction(TestPerfEventSelinuxAction, "TestPerfEventSelinux");
     am.QueueEventTrigger("early-init");
+    am.QueueBuiltinAction(ConnectEarlyStageSnapuserdAction, "ConnectEarlyStageSnapuserd");
 
     // Queue an action that waits for coldboot done so we know ueventd has set up all of /dev...
     am.QueueBuiltinAction(wait_for_coldboot_done_action, "wait_for_coldboot_done");
@@ -899,47 +1093,46 @@ int SecondStageMain(int argc, char** argv) {
     // Restore prio before main loop
     setpriority(PRIO_PROCESS, 0, 0);
     while (true) {
-        // By default, sleep until something happens.
-        auto epoll_timeout = std::optional<std::chrono::milliseconds>{};
+        // By default, sleep until something happens. Do not convert far_future into
+        // std::chrono::milliseconds because that would trigger an overflow. The unit of boot_clock
+        // is 1ns.
+        const boot_clock::time_point far_future = boot_clock::time_point::max();
+        boot_clock::time_point next_action_time = far_future;
 
         auto shutdown_command = shutdown_state.CheckShutdown();
         if (shutdown_command) {
             LOG(INFO) << "Got shutdown_command '" << *shutdown_command
                       << "' Calling HandlePowerctlMessage()";
             HandlePowerctlMessage(*shutdown_command);
-            shutdown_state.set_do_shutdown(false);
         }
 
         if (!(prop_waiter_state.MightBeWaiting() || Service::is_exec_service_running())) {
             am.ExecuteOneCommand();
+            // If there's more work to do, wake up again immediately.
+            if (am.HasMoreCommands()) {
+                next_action_time = boot_clock::now();
+            }
         }
+        // Since the above code examined pending actions, no new actions must be
+        // queued by the code between this line and the Epoll::Wait() call below
+        // without calling WakeMainInitThread().
         if (!IsShuttingDown()) {
             auto next_process_action_time = HandleProcessActions();
 
             // If there's a process that needs restarting, wake up in time for that.
             if (next_process_action_time) {
-                epoll_timeout = std::chrono::ceil<std::chrono::milliseconds>(
-                        *next_process_action_time - boot_clock::now());
-                if (*epoll_timeout < 0ms) epoll_timeout = 0ms;
+                next_action_time = std::min(next_action_time, *next_process_action_time);
             }
         }
 
-        if (!(prop_waiter_state.MightBeWaiting() || Service::is_exec_service_running())) {
-            // If there's more work to do, wake up again immediately.
-            if (am.HasMoreCommands()) epoll_timeout = 0ms;
+        std::optional<std::chrono::milliseconds> epoll_timeout;
+        if (next_action_time != far_future) {
+            epoll_timeout = std::chrono::ceil<std::chrono::milliseconds>(
+                    std::max(next_action_time - boot_clock::now(), 0ns));
         }
-
-        auto pending_functions = epoll.Wait(epoll_timeout);
-        if (!pending_functions.ok()) {
-            LOG(ERROR) << pending_functions.error();
-        } else if (!pending_functions->empty()) {
-            // We always reap children before responding to the other pending functions. This is to
-            // prevent a race where other daemons see that a service has exited and ask init to
-            // start it again via ctl.start before init has reaped it.
-            ReapAnyOutstandingChildren();
-            for (const auto& function : *pending_functions) {
-                (*function)();
-            }
+        auto epoll_result = epoll.Wait(epoll_timeout);
+        if (!epoll_result.ok()) {
+            LOG(ERROR) << epoll_result.error();
         }
         if (!IsShuttingDown()) {
             HandleControlMessages();

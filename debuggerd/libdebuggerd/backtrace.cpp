@@ -34,19 +34,22 @@
 #include <memory>
 #include <string>
 
+#include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <log/log.h>
+#include <unwindstack/AndroidUnwinder.h>
 #include <unwindstack/Unwinder.h>
 
 #include "libdebuggerd/types.h"
 #include "libdebuggerd/utility.h"
 #include "util.h"
 
-static void dump_process_header(log_t* log, pid_t pid, const char* process_name) {
+static void dump_process_header(log_t* log, pid_t pid,
+                                const std::vector<std::string>& command_line) {
   _LOG(log, logtype::BACKTRACE, "\n\n----- pid %d at %s -----\n", pid, get_timestamp().c_str());
 
-  if (process_name) {
-    _LOG(log, logtype::BACKTRACE, "Cmd line: %s\n", process_name);
+  if (!command_line.empty()) {
+    _LOG(log, logtype::BACKTRACE, "Cmd line: %s\n", android::base::Join(command_line, " ").c_str());
   }
   _LOG(log, logtype::BACKTRACE, "ABI: '%s'\n", ABI_STRING);
 }
@@ -55,7 +58,7 @@ static void dump_process_footer(log_t* log, pid_t pid) {
   _LOG(log, logtype::BACKTRACE, "\n----- end %d -----\n", pid);
 }
 
-void dump_backtrace_thread(int output_fd, unwindstack::Unwinder* unwinder,
+void dump_backtrace_thread(int output_fd, unwindstack::AndroidUnwinder* unwinder,
                            const ThreadInfo& thread) {
   log_t log;
   log.tfd = output_fd;
@@ -63,21 +66,17 @@ void dump_backtrace_thread(int output_fd, unwindstack::Unwinder* unwinder,
 
   _LOG(&log, logtype::BACKTRACE, "\n\"%s\" sysTid=%d\n", thread.thread_name.c_str(), thread.tid);
 
-  unwinder->SetRegs(thread.registers.get());
-  unwinder->Unwind();
-  if (unwinder->NumFrames() == 0) {
-    _LOG(&log, logtype::THREAD, "Unwind failed: tid = %d\n", thread.tid);
-    if (unwinder->LastErrorCode() != unwindstack::ERROR_NONE) {
-      _LOG(&log, logtype::THREAD, "  Error code: %s\n", unwinder->LastErrorCodeString());
-      _LOG(&log, logtype::THREAD, "  Error address: 0x%" PRIx64 "\n", unwinder->LastErrorAddress());
-    }
+  unwindstack::AndroidUnwinderData data;
+  if (!unwinder->Unwind(thread.registers.get(), data)) {
+    _LOG(&log, logtype::THREAD, "Unwind failed: tid = %d: Error %s\n", thread.tid,
+         data.GetErrorString().c_str());
     return;
   }
 
-  log_backtrace(&log, unwinder, "  ");
+  log_backtrace(&log, unwinder, data, "  ");
 }
 
-void dump_backtrace(android::base::unique_fd output_fd, unwindstack::Unwinder* unwinder,
+void dump_backtrace(android::base::unique_fd output_fd, unwindstack::AndroidUnwinder* unwinder,
                     const std::map<pid_t, ThreadInfo>& thread_info, pid_t target_thread) {
   log_t log;
   log.tfd = output_fd.get();
@@ -89,7 +88,7 @@ void dump_backtrace(android::base::unique_fd output_fd, unwindstack::Unwinder* u
     return;
   }
 
-  dump_process_header(&log, target->second.pid, target->second.process_name.c_str());
+  dump_process_header(&log, target->second.pid, target->second.command_line);
 
   dump_backtrace_thread(output_fd.get(), unwinder, target->second);
   for (const auto& [tid, info] : thread_info) {
@@ -107,7 +106,7 @@ void dump_backtrace_header(int output_fd) {
   log.amfd_data = nullptr;
 
   pid_t pid = getpid();
-  dump_process_header(&log, pid, get_process_name(pid).c_str());
+  dump_process_header(&log, pid, get_command_line(pid));
 }
 
 void dump_backtrace_footer(int output_fd) {

@@ -26,11 +26,13 @@
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/strings.h>
-#include <backtrace/Backtrace.h>
 #include <cutils/android_reboot.h>
+#include <fs_mgr.h>
+#include <unwindstack/AndroidUnwinder.h>
 
 #include "capabilities.h"
 #include "reboot_utils.h"
+#include "util.h"
 
 namespace android {
 namespace init {
@@ -38,31 +40,43 @@ namespace init {
 static std::string init_fatal_reboot_target = "bootloader";
 static bool init_fatal_panic = false;
 
+// this needs to read the /proc/* files directly because it is called before
+// ro.boot.* properties are initialized
 void SetFatalRebootTarget(const std::optional<std::string>& reboot_target) {
     std::string cmdline;
     android::base::ReadFileToString("/proc/cmdline", &cmdline);
     cmdline = android::base::Trim(cmdline);
 
-    const char kInitFatalPanicString[] = "androidboot.init_fatal_panic=true";
-    init_fatal_panic = cmdline.find(kInitFatalPanicString) != std::string::npos;
+    const std::string kInitFatalPanicParamString = "androidboot.init_fatal_panic";
+    if (cmdline.find(kInitFatalPanicParamString) == std::string::npos) {
+        std::string value;
+        init_fatal_panic = (android::fs_mgr::GetBootconfig(kInitFatalPanicParamString, &value) &&
+                            value == "true");
+    } else {
+        const std::string kInitFatalPanicString = kInitFatalPanicParamString + "=true";
+        init_fatal_panic = cmdline.find(kInitFatalPanicString) != std::string::npos;
+    }
 
     if (reboot_target) {
         init_fatal_reboot_target = *reboot_target;
         return;
     }
 
-    const char kRebootTargetString[] = "androidboot.init_fatal_reboot_target=";
+    const std::string kRebootTargetString = "androidboot.init_fatal_reboot_target";
     auto start_pos = cmdline.find(kRebootTargetString);
     if (start_pos == std::string::npos) {
-        return;  // We already default to bootloader if no setting is provided.
-    }
-    start_pos += sizeof(kRebootTargetString) - 1;
+        android::fs_mgr::GetBootconfig(kRebootTargetString, &init_fatal_reboot_target);
+        // We already default to bootloader if no setting is provided.
+    } else {
+        const std::string kRebootTargetStringPattern = kRebootTargetString + "=";
+        start_pos += sizeof(kRebootTargetStringPattern) - 1;
 
-    auto end_pos = cmdline.find(' ', start_pos);
-    // if end_pos isn't found, then we've run off the end, but this is okay as this is the last
-    // entry, and -1 is a valid size for string::substr();
-    auto size = end_pos == std::string::npos ? -1 : end_pos - start_pos;
-    init_fatal_reboot_target = cmdline.substr(start_pos, size);
+        auto end_pos = cmdline.find(' ', start_pos);
+        // if end_pos isn't found, then we've run off the end, but this is okay as this is the last
+        // entry, and -1 is a valid size for string::substr();
+        auto size = end_pos == std::string::npos ? -1 : end_pos - start_pos;
+        init_fatal_reboot_target = cmdline.substr(start_pos, size);
+    }
 }
 
 bool IsRebootCapable() {
@@ -85,7 +99,8 @@ bool IsRebootCapable() {
     return value == CAP_SET;
 }
 
-void __attribute__((noreturn)) RebootSystem(unsigned int cmd, const std::string& rebootTarget) {
+void __attribute__((noreturn))
+RebootSystem(unsigned int cmd, const std::string& rebootTarget, const std::string& reboot_reason) {
     LOG(INFO) << "Reboot ending, jumping to kernel";
 
     if (!IsRebootCapable()) {
@@ -106,10 +121,12 @@ void __attribute__((noreturn)) RebootSystem(unsigned int cmd, const std::string&
 
         case ANDROID_RB_THERMOFF:
             if (android::base::GetBoolProperty("ro.thermal_warmreset", false)) {
+                std::string reason = "shutdown,thermal";
+                if (!reboot_reason.empty()) reason = reboot_reason;
+
                 LOG(INFO) << "Try to trigger a warm reset for thermal shutdown";
-                static constexpr const char kThermalShutdownTarget[] = "shutdown,thermal";
                 syscall(__NR_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
-                        LINUX_REBOOT_CMD_RESTART2, kThermalShutdownTarget);
+                        LINUX_REBOOT_CMD_RESTART2, reason.c_str());
             } else {
                 reboot(RB_POWER_OFF);
             }
@@ -136,13 +153,13 @@ void __attribute__((noreturn)) InitFatalReboot(int signal_number) {
 
     // In the parent, let's try to get a backtrace then shutdown.
     LOG(ERROR) << __FUNCTION__ << ": signal " << signal_number;
-    std::unique_ptr<Backtrace> backtrace(
-            Backtrace::Create(BACKTRACE_CURRENT_PROCESS, BACKTRACE_CURRENT_THREAD));
-    if (!backtrace->Unwind(0)) {
-        LOG(ERROR) << __FUNCTION__ << ": Failed to unwind callstack.";
+    unwindstack::AndroidLocalUnwinder unwinder;
+    unwindstack::AndroidUnwinderData data;
+    if (!unwinder.Unwind(data)) {
+        LOG(ERROR) << __FUNCTION__ << ": Failed to unwind callstack: " << data.GetErrorString();
     }
-    for (size_t i = 0; i < backtrace->NumFrames(); i++) {
-        LOG(ERROR) << backtrace->FormatFrameData(i);
+    for (const auto& frame : data.frames) {
+        LOG(ERROR) << unwinder.FormatFrame(frame);
     }
     if (init_fatal_panic) {
         LOG(ERROR) << __FUNCTION__ << ": Trigger crash";

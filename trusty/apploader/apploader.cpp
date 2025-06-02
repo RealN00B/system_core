@@ -19,6 +19,7 @@
 #include <BufferAllocator/BufferAllocator.h>
 #include <android-base/logging.h>
 #include <android-base/unique_fd.h>
+#include <assert.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <stdbool.h>
@@ -43,7 +44,7 @@ constexpr const char kTrustyDefaultDeviceName[] = "/dev/trusty-ipc-dev0";
 
 static const char* dev_name = kTrustyDefaultDeviceName;
 
-static const char* _sopts = "hs";
+static const char* _sopts = "hD:";
 static const struct option _lopts[] = {
         {"help", no_argument, 0, 'h'},
         {"dev", required_argument, 0, 'D'},
@@ -96,17 +97,21 @@ static unique_fd read_file(const char* file_name, off64_t* out_file_size) {
 
     unique_fd file_fd(TEMP_FAILURE_RETRY(open(file_name, O_RDONLY)));
     if (!file_fd.ok()) {
-        fprintf(stderr, "Error opening file '%s': %s\n", file_name, strerror(errno));
+        PLOG(ERROR) << "Error opening file " << file_name;
         return {};
     }
 
     rc = fstat64(file_fd, &st);
     if (rc < 0) {
-        fprintf(stderr, "Error calling stat on file '%s': %s\n", file_name, strerror(errno));
+        PLOG(ERROR) << "Error calling stat on file '" << file_name << "'";
         return {};
     }
 
-    assert(st.st_size >= 0);
+    if (st.st_size == 0) {
+        LOG(ERROR) << "Zero length file '" << file_name << "'";
+        return {};
+    }
+
     file_size = st.st_size;
 
     /* The dmabuf size needs to be a multiple of the page size */
@@ -115,14 +120,15 @@ static unique_fd read_file(const char* file_name, off64_t* out_file_size) {
         file_page_offset = page_size - file_page_offset;
     }
     if (__builtin_add_overflow(file_size, file_page_offset, &file_page_size)) {
-        fprintf(stderr, "Failed to page-align file size\n");
+        LOG(ERROR) << "Failed to page-align file size";
         return {};
     }
 
     BufferAllocator alloc;
     unique_fd dmabuf_fd(alloc.Alloc(kDmabufSystemHeapName, file_page_size));
     if (!dmabuf_fd.ok()) {
-        fprintf(stderr, "Error creating dmabuf: %d\n", dmabuf_fd.get());
+        LOG(ERROR) << "Error creating dmabuf for " << file_page_size
+                   << " bytes: " << dmabuf_fd.get();
         return dmabuf_fd;
     }
 
@@ -137,12 +143,12 @@ static unique_fd read_file(const char* file_name, off64_t* out_file_size) {
                 pread(file_fd, (char*)shm + file_offset, file_size - file_offset, file_offset));
 
         if (num_read < 0) {
-            fprintf(stderr, "Error reading package file '%s': %s\n", file_name, strerror(errno));
+            PLOG(ERROR) << "Error reading package file '" << file_name << "'";
             break;
         }
 
         if (num_read == 0) {
-            fprintf(stderr, "Unexpected end of file '%s'\n", file_name);
+            LOG(ERROR) << "Unexpected end of file '" << file_name << "'";
             break;
         }
 
@@ -182,17 +188,17 @@ static ssize_t read_response(int tipc_fd) {
     struct apploader_resp resp;
     ssize_t rc = read(tipc_fd, &resp, sizeof(resp));
     if (rc < 0) {
-        fprintf(stderr, "Failed to read response: %zd\n", rc);
+        PLOG(ERROR) << "Failed to read response";
         return rc;
     }
 
     if (rc < sizeof(resp)) {
-        fprintf(stderr, "Not enough data in response: %zd\n", rc);
+        LOG(ERROR) << "Not enough data in response: " << rc;
         return -EIO;
     }
 
     if (resp.hdr.cmd != (APPLOADER_CMD_LOAD_APPLICATION | APPLOADER_RESP_BIT)) {
-        fprintf(stderr, "Invalid command in response: %u\n", resp.hdr.cmd);
+        LOG(ERROR) << "Invalid command in response: " << resp.hdr.cmd;
         return -EINVAL;
     }
 
@@ -200,28 +206,37 @@ static ssize_t read_response(int tipc_fd) {
         case APPLOADER_NO_ERROR:
             break;
         case APPLOADER_ERR_UNKNOWN_CMD:
-            fprintf(stderr, "Error: unknown command\n");
+            LOG(ERROR) << "Error: unknown command";
             break;
         case APPLOADER_ERR_INVALID_CMD:
-            fprintf(stderr, "Error: invalid command arguments\n");
+            LOG(ERROR) << "Error: invalid command arguments";
             break;
         case APPLOADER_ERR_NO_MEMORY:
-            fprintf(stderr, "Error: out of Trusty memory\n");
+            LOG(ERROR) << "Error: out of Trusty memory";
             break;
         case APPLOADER_ERR_VERIFICATION_FAILED:
-            fprintf(stderr, "Error: failed to verify the package\n");
+            LOG(ERROR) << "Error: failed to verify the package";
             break;
         case APPLOADER_ERR_LOADING_FAILED:
-            fprintf(stderr, "Error: failed to load the package\n");
+            LOG(ERROR) << "Error: failed to load the package";
             break;
         case APPLOADER_ERR_ALREADY_EXISTS:
-            fprintf(stderr, "Error: application already exists\n");
+            LOG(ERROR) << "Error: application already exists";
             break;
         case APPLOADER_ERR_INTERNAL:
-            fprintf(stderr, "Error: internal apploader error\n");
+            LOG(ERROR) << "Error: internal apploader error";
+            break;
+        case APPLOADER_ERR_INVALID_VERSION:
+            LOG(ERROR) << "Error: invalid application version";
+            break;
+        case APPLOADER_ERR_POLICY_VIOLATION:
+            LOG(ERROR) << "Error: loading denied by policy engine";
+            break;
+        case APPLOADER_ERR_NOT_ENCRYPTED:
+            LOG(ERROR) << "Error: unmet application encryption requirement";
             break;
         default:
-            fprintf(stderr, "Unrecognized error: %u\n", resp.error);
+            LOG(ERROR) << "Unrecognized error: " << resp.error;
             break;
     }
 
@@ -241,6 +256,8 @@ static ssize_t send_app_package(const char* package_file_name) {
 
     tipc_fd = tipc_connect(dev_name, APPLOADER_PORT);
     if (tipc_fd < 0) {
+        LOG(ERROR) << "Failed to connect to Trusty app loader: " << strerror(-tipc_fd);
+        // print this to stderr too to avoid silently exiting when run as non-root
         fprintf(stderr, "Failed to connect to Trusty app loader: %s\n", strerror(-tipc_fd));
         rc = tipc_fd;
         goto err_tipc_connect;
@@ -248,7 +265,7 @@ static ssize_t send_app_package(const char* package_file_name) {
 
     rc = send_load_message(tipc_fd, package_fd, package_size);
     if (rc < 0) {
-        fprintf(stderr, "Failed to send package: %zd\n", rc);
+        LOG(ERROR) << "Failed to send package: " << rc;
         goto err_send;
     }
 

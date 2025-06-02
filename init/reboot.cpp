@@ -18,6 +18,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/f2fs.h>
 #include <linux/fs.h>
 #include <linux/loop.h>
 #include <mntent.h>
@@ -38,7 +39,6 @@
 #include <thread>
 #include <vector>
 
-#include <InitProperties.sysprop.h>
 #include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -50,6 +50,7 @@
 #include <bootloader_message/bootloader_message.h>
 #include <cutils/android_reboot.h>
 #include <fs_mgr.h>
+#include <libsnapshot/snapshot.h>
 #include <logwrap/logwrap.h>
 #include <private/android_filesystem_config.h>
 #include <selinux/selinux.h>
@@ -84,17 +85,6 @@ namespace init {
 static bool shutting_down = false;
 
 static const std::set<std::string> kDebuggingServices{"tombstoned", "logd", "adbd", "console"};
-
-static std::vector<Service*> GetDebuggingServices(bool only_post_data) {
-    std::vector<Service*> ret;
-    ret.reserve(kDebuggingServices.size());
-    for (const auto& s : ServiceList::GetInstance()) {
-        if (kDebuggingServices.count(s->name()) && (!only_post_data || s->is_post_data())) {
-            ret.push_back(s.get());
-        }
-    }
-    return ret;
-}
 
 static void PersistRebootReason(const char* reason, bool write_to_property) {
     if (write_to_property) {
@@ -219,7 +209,7 @@ static void LogShutdownTime(UmountStat stat, Timer* t) {
                  << stat;
 }
 
-static bool IsDataMounted() {
+static bool IsDataMounted(const std::string& fstype) {
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> fp(setmntent("/proc/mounts", "re"), endmntent);
     if (fp == nullptr) {
         PLOG(ERROR) << "Failed to open /proc/mounts";
@@ -228,7 +218,7 @@ static bool IsDataMounted() {
     mntent* mentry;
     while ((mentry = getmntent(fp.get())) != nullptr) {
         if (mentry->mnt_dir == "/data"s) {
-            return true;
+            return fstype == "*" || mentry->mnt_type == fstype;
         }
     }
     return false;
@@ -422,11 +412,31 @@ static UmountStat TryUmountAndFsck(unsigned int cmd, bool run_fsck,
     if (run_fsck && !FindPartitionsToUmount(&block_devices, &emulated_devices, false)) {
         return UMOUNT_STAT_ERROR;
     }
-
+    auto sm = snapshot::SnapshotManager::New();
+    bool ota_update_in_progress = false;
+    if (sm->IsUserspaceSnapshotUpdateInProgress()) {
+        LOG(INFO) << "OTA update in progress";
+        ota_update_in_progress = true;
+    }
     UmountStat stat = UmountPartitions(timeout - t.duration());
     if (stat != UMOUNT_STAT_SUCCESS) {
         LOG(INFO) << "umount timeout, last resort, kill all and try";
         if (DUMP_ON_UMOUNT_FAILURE) DumpUmountDebuggingInfo();
+        // Since umount timedout, we will try to kill all processes
+        // and do one more attempt to umount the partitions.
+        //
+        // However, if OTA update is in progress, we don't want
+        // to kill the snapuserd daemon as the daemon will
+        // be serving I/O requests. Killing the daemon will
+        // end up with I/O failures. If the update is in progress,
+        // we will just return the umount failure status immediately.
+        // This is ok, given the fact that killing the processes
+        // and doing an umount is just a last effort. We are
+        // still not doing fsck when all processes are killed.
+        //
+        if (ota_update_in_progress) {
+            return stat;
+        }
         KillAllProcesses();
         // even if it succeeds, still it is timeout and do not run fsck with all processes killed
         UmountStat st = UmountPartitions(0ms);
@@ -451,10 +461,22 @@ static UmountStat TryUmountAndFsck(unsigned int cmd, bool run_fsck,
 
 // zram is able to use backing device on top of a loopback device.
 // In order to unmount /data successfully, we have to kill the loopback device first
-#define ZRAM_DEVICE   "/dev/block/zram0"
-#define ZRAM_RESET    "/sys/block/zram0/reset"
-#define ZRAM_BACK_DEV "/sys/block/zram0/backing_dev"
+#define ZRAM_DEVICE       "/dev/block/zram0"
+#define ZRAM_RESET        "/sys/block/zram0/reset"
+#define ZRAM_BACK_DEV     "/sys/block/zram0/backing_dev"
+#define ZRAM_INITSTATE    "/sys/block/zram0/initstate"
 static Result<void> KillZramBackingDevice() {
+    std::string zram_initstate;
+    if (!android::base::ReadFileToString(ZRAM_INITSTATE, &zram_initstate)) {
+        return ErrnoError() << "Failed to read " << ZRAM_INITSTATE;
+    }
+
+    zram_initstate.erase(zram_initstate.length() - 1);
+    if (zram_initstate == "0") {
+        LOG(INFO) << "Zram has not been swapped on";
+        return {};
+    }
+
     if (access(ZRAM_BACK_DEV, F_OK) != 0 && errno == ENOENT) {
         LOG(INFO) << "No zram backing device configured";
         return {};
@@ -467,6 +489,11 @@ static Result<void> KillZramBackingDevice() {
     // cut the last "\n"
     backing_dev.erase(backing_dev.length() - 1);
 
+    if (android::base::StartsWith(backing_dev, "none")) {
+        LOG(INFO) << "No zram backing device configured";
+        return {};
+    }
+
     // shutdown zram handle
     Timer swap_timer;
     LOG(INFO) << "swapoff() start...";
@@ -474,7 +501,7 @@ static Result<void> KillZramBackingDevice() {
         return ErrnoError() << "zram_backing_dev: swapoff (" << backing_dev << ")"
                             << " failed";
     }
-    LOG(INFO) << "swapoff() took " << swap_timer;;
+    LOG(INFO) << "swapoff() took " << swap_timer;
 
     if (!WriteStringToFile("1", ZRAM_RESET)) {
         return Error() << "zram_backing_dev: reset (" << backing_dev << ")"
@@ -503,13 +530,18 @@ static Result<void> KillZramBackingDevice() {
 
 // Stops given services, waits for them to be stopped for |timeout| ms.
 // If terminate is true, then SIGTERM is sent to services, otherwise SIGKILL is sent.
-static void StopServices(const std::vector<Service*>& services, std::chrono::milliseconds timeout,
+// Note that services are stopped in order given by |ServiceList::services_in_shutdown_order|
+// function.
+static void StopServices(const std::set<std::string>& services, std::chrono::milliseconds timeout,
                          bool terminate) {
     LOG(INFO) << "Stopping " << services.size() << " services by sending "
               << (terminate ? "SIGTERM" : "SIGKILL");
     std::vector<pid_t> pids;
     pids.reserve(services.size());
-    for (const auto& s : services) {
+    for (const auto& s : ServiceList::GetInstance().services_in_shutdown_order()) {
+        if (services.count(s->name()) == 0) {
+            continue;
+        }
         if (s->pid() > 0) {
             pids.push_back(s->pid());
         }
@@ -520,7 +552,7 @@ static void StopServices(const std::vector<Service*>& services, std::chrono::mil
         }
     }
     if (timeout > 0ms) {
-        WaitToBeReaped(pids, timeout);
+        WaitToBeReaped(Service::GetSigchldFd(), pids, timeout);
     } else {
         // Even if we don't to wait for services to stop, we still optimistically reap zombies.
         ReapAnyOutstandingChildren();
@@ -529,12 +561,12 @@ static void StopServices(const std::vector<Service*>& services, std::chrono::mil
 
 // Like StopServices, but also logs all the services that failed to stop after the provided timeout.
 // Returns number of violators.
-static int StopServicesAndLogViolations(const std::vector<Service*>& services,
-                                        std::chrono::milliseconds timeout, bool terminate) {
+int StopServicesAndLogViolations(const std::set<std::string>& services,
+                                 std::chrono::milliseconds timeout, bool terminate) {
     StopServices(services, timeout, terminate);
     int still_running = 0;
-    for (const auto& s : services) {
-        if (s->IsRunning()) {
+    for (const auto& s : ServiceList::GetInstance()) {
+        if (s->IsRunning() && services.count(s->name())) {
             LOG(ERROR) << "[service-misbehaving] : service '" << s->name() << "' is still running "
                        << timeout.count() << "ms after receiving "
                        << (terminate ? "SIGTERM" : "SIGKILL");
@@ -545,6 +577,11 @@ static int StopServicesAndLogViolations(const std::vector<Service*>& services,
 }
 
 static Result<void> UnmountAllApexes() {
+    // don't need to unmount because apexd doesn't use /data in Microdroid
+    if (IsMicrodroid()) {
+        return {};
+    }
+
     const char* args[] = {"/system/bin/apexd", "--unmount-all"};
     int status;
     if (logwrap_fork_execvp(arraysize(args), args, &status, false, LOG_KLOG, true, nullptr) != 0) {
@@ -586,7 +623,7 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
     if (sem_init(&reboot_semaphore, false, 0) == -1) {
         // These should never fail, but if they do, skip the graceful reboot and reboot immediately.
         LOG(ERROR) << "sem_init() fail and RebootSystem() return!";
-        RebootSystem(cmd, reboot_target);
+        RebootSystem(cmd, reboot_target, reason);
     }
 
     // Start a thread to monitor init shutdown process
@@ -612,16 +649,16 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
 
     // If /data isn't mounted then we can skip the extra reboot steps below, since we don't need to
     // worry about unmounting it.
-    if (!IsDataMounted()) {
+    if (!IsDataMounted("*")) {
         sync();
-        RebootSystem(cmd, reboot_target);
+        RebootSystem(cmd, reboot_target, reason);
         abort();
     }
 
+    bool do_shutdown_animation = GetBoolProperty("ro.init.shutdown_animation", false);
     // watchdogd is a vendor specific component but should be alive to complete shutdown safely.
     const std::set<std::string> to_starts{"watchdogd"};
-    std::vector<Service*> stop_first;
-    stop_first.reserve(ServiceList::GetInstance().services().size());
+    std::set<std::string> stop_first;
     for (const auto& s : ServiceList::GetInstance()) {
         if (kDebuggingServices.count(s->name())) {
             // keep debugging tools until non critical ones are all gone.
@@ -632,6 +669,8 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
                            << "': " << result.error();
             }
             s->SetShutdownCritical();
+        } else if (do_shutdown_animation && s->classnames().count("animation") > 0) {
+            // Need these for shutdown animations.
         } else if (s->IsShutdownCritical()) {
             // Start shutdown critical service if not started.
             if (auto result = s->Start(); !result.ok()) {
@@ -639,19 +678,18 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
                            << "': " << result.error();
             }
         } else {
-            stop_first.push_back(s.get());
+            stop_first.insert(s->name());
         }
     }
 
     // remaining operations (specifically fsck) may take a substantial duration
-    if (cmd == ANDROID_RB_POWEROFF || is_thermal_shutdown) {
+    if (!do_shutdown_animation && (cmd == ANDROID_RB_POWEROFF || is_thermal_shutdown)) {
         TurnOffBacklight();
     }
 
     Service* boot_anim = ServiceList::GetInstance().FindService("bootanim");
     Service* surface_flinger = ServiceList::GetInstance().FindService("surfaceflinger");
     if (boot_anim != nullptr && surface_flinger != nullptr && surface_flinger->IsRunning()) {
-        bool do_shutdown_animation = GetBoolProperty("ro.init.shutdown_animation", false);
 
         if (do_shutdown_animation) {
             SetProperty("service.bootanim.exit", "0");
@@ -703,7 +741,7 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
         LOG(INFO) << "vold not running, skipping vold shutdown";
     }
     // logcat stopped here
-    StopServices(GetDebuggingServices(false /* only_post_data */), 0ms, false /* SIGKILL */);
+    StopServices(kDebuggingServices, 0ms, false /* SIGKILL */);
     // 4. sync, try umount, and optionally run fsck for user shutdown
     {
         Timer sync_timer;
@@ -736,7 +774,17 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
     sem_post(&reboot_semaphore);
 
     // Reboot regardless of umount status. If umount fails, fsck after reboot will fix it.
-    RebootSystem(cmd, reboot_target);
+    if (IsDataMounted("f2fs")) {
+        uint32_t flag = F2FS_GOING_DOWN_FULLSYNC;
+        unique_fd fd(TEMP_FAILURE_RETRY(open("/data", O_RDONLY)));
+        int ret = ioctl(fd.get(), F2FS_IOC_SHUTDOWN, &flag);
+        if (ret) {
+            PLOG(ERROR) << "Shutdown /data: ";
+        } else {
+            LOG(INFO) << "Shutdown /data";
+        }
+    }
+    RebootSystem(cmd, reboot_target, reason);
     abort();
 }
 
@@ -749,184 +797,6 @@ static void EnterShutdown() {
     for (const auto& s : ServiceList::GetInstance()) {
         s->UnSetExec();
     }
-}
-
-static void LeaveShutdown() {
-    LOG(INFO) << "Leaving shutdown mode";
-    shutting_down = false;
-    StartSendingMessages();
-}
-
-static std::chrono::milliseconds GetMillisProperty(const std::string& name,
-                                                   std::chrono::milliseconds default_value) {
-    auto value = GetUintProperty(name, static_cast<uint64_t>(default_value.count()));
-    return std::chrono::milliseconds(std::move(value));
-}
-
-static Result<void> DoUserspaceReboot() {
-    LOG(INFO) << "Userspace reboot initiated";
-    // An ugly way to pass a more precise reason on why fallback to hard reboot was triggered.
-    std::string sub_reason = "";
-    auto guard = android::base::make_scope_guard([&sub_reason] {
-        // Leave shutdown so that we can handle a full reboot.
-        LeaveShutdown();
-        trigger_shutdown("reboot,userspace_failed,shutdown_aborted," + sub_reason);
-    });
-    // Triggering userspace-reboot-requested will result in a bunch of setprop
-    // actions. We should make sure, that all of them are propagated before
-    // proceeding with userspace reboot. Synchronously setting sys.init.userspace_reboot.in_progress
-    // property is not perfect, but it should do the trick.
-    if (!android::sysprop::InitProperties::userspace_reboot_in_progress(true)) {
-        sub_reason = "setprop";
-        return Error() << "Failed to set sys.init.userspace_reboot.in_progress property";
-    }
-    EnterShutdown();
-    if (!SetProperty("sys.powerctl", "")) {
-        sub_reason = "resetprop";
-        return Error() << "Failed to reset sys.powerctl property";
-    }
-    std::vector<Service*> stop_first;
-    // Remember the services that were enabled. We will need to manually enable them again otherwise
-    // triggers like class_start won't restart them.
-    std::vector<Service*> were_enabled;
-    stop_first.reserve(ServiceList::GetInstance().services().size());
-    for (const auto& s : ServiceList::GetInstance().services_in_shutdown_order()) {
-        if (s->is_post_data() && !kDebuggingServices.count(s->name())) {
-            stop_first.push_back(s);
-        }
-        if (s->is_post_data() && s->IsEnabled()) {
-            were_enabled.push_back(s);
-        }
-    }
-    {
-        Timer sync_timer;
-        LOG(INFO) << "sync() before terminating services...";
-        sync();
-        LOG(INFO) << "sync() took " << sync_timer;
-    }
-    auto sigterm_timeout = GetMillisProperty("init.userspace_reboot.sigterm.timeoutmillis", 5s);
-    auto sigkill_timeout = GetMillisProperty("init.userspace_reboot.sigkill.timeoutmillis", 10s);
-    LOG(INFO) << "Timeout to terminate services: " << sigterm_timeout.count() << "ms "
-              << "Timeout to kill services: " << sigkill_timeout.count() << "ms";
-    std::string services_file_name = "/metadata/userspacereboot/services.txt";
-    const int flags = O_RDWR | O_CREAT | O_SYNC | O_APPEND | O_CLOEXEC;
-    StopServicesAndLogViolations(stop_first, sigterm_timeout, true /* SIGTERM */);
-    if (int r = StopServicesAndLogViolations(stop_first, sigkill_timeout, false /* SIGKILL */);
-        r > 0) {
-        auto fd = unique_fd(TEMP_FAILURE_RETRY(open(services_file_name.c_str(), flags, 0666)));
-        android::base::WriteStringToFd("Post-data services still running: \n", fd);
-        for (const auto& s : stop_first) {
-            if (s->IsRunning()) {
-                android::base::WriteStringToFd(s->name() + "\n", fd);
-            }
-        }
-        sub_reason = "sigkill";
-        return Error() << r << " post-data services are still running";
-    }
-    if (auto result = KillZramBackingDevice(); !result.ok()) {
-        sub_reason = "zram";
-        return result;
-    }
-    if (auto result = CallVdc("volume", "reset"); !result.ok()) {
-        sub_reason = "vold_reset";
-        return result;
-    }
-    if (int r = StopServicesAndLogViolations(GetDebuggingServices(true /* only_post_data */),
-                                             sigkill_timeout, false /* SIGKILL */);
-        r > 0) {
-        auto fd = unique_fd(TEMP_FAILURE_RETRY(open(services_file_name.c_str(), flags, 0666)));
-        android::base::WriteStringToFd("Debugging services still running: \n", fd);
-        for (const auto& s : GetDebuggingServices(true)) {
-            if (s->IsRunning()) {
-                android::base::WriteStringToFd(s->name() + "\n", fd);
-            }
-        }
-        sub_reason = "sigkill_debug";
-        return Error() << r << " debugging services are still running";
-    }
-    {
-        Timer sync_timer;
-        LOG(INFO) << "sync() after stopping services...";
-        sync();
-        LOG(INFO) << "sync() took " << sync_timer;
-    }
-    if (auto result = UnmountAllApexes(); !result.ok()) {
-        sub_reason = "apex";
-        return result;
-    }
-    if (!SwitchToMountNamespaceIfNeeded(NS_BOOTSTRAP).ok()) {
-        sub_reason = "ns_switch";
-        return Error() << "Failed to switch to bootstrap namespace";
-    }
-    // Remove services that were defined in an APEX.
-    ServiceList::GetInstance().RemoveServiceIf([](const std::unique_ptr<Service>& s) -> bool {
-        if (s->is_from_apex()) {
-            LOG(INFO) << "Removing service '" << s->name() << "' because it's defined in an APEX";
-            return true;
-        }
-        return false;
-    });
-    // Re-enable services
-    for (const auto& s : were_enabled) {
-        LOG(INFO) << "Re-enabling service '" << s->name() << "'";
-        s->Enable();
-    }
-    ServiceList::GetInstance().ResetState();
-    LeaveShutdown();
-    ActionManager::GetInstance().QueueEventTrigger("userspace-reboot-resume");
-    guard.Disable();  // Go on with userspace reboot.
-    return {};
-}
-
-static void UserspaceRebootWatchdogThread() {
-    auto started_timeout = GetMillisProperty("init.userspace_reboot.started.timeoutmillis", 10s);
-    if (!WaitForProperty("sys.init.userspace_reboot.in_progress", "1", started_timeout)) {
-        LOG(ERROR) << "Userspace reboot didn't start in " << started_timeout.count()
-                   << "ms. Switching to full reboot";
-        // Init might be wedged, don't try to write reboot reason into a persistent property and do
-        // a dirty reboot.
-        PersistRebootReason("userspace_failed,watchdog_triggered,failed_to_start", false);
-        RebootSystem(ANDROID_RB_RESTART2, "userspace_failed,watchdog_triggered,failed_to_start");
-    }
-    LOG(INFO) << "Starting userspace reboot watchdog";
-    auto watchdog_timeout = GetMillisProperty("init.userspace_reboot.watchdog.timeoutmillis", 5min);
-    LOG(INFO) << "UserspaceRebootWatchdog timeout: " << watchdog_timeout.count() << "ms";
-    if (!WaitForProperty("sys.boot_completed", "1", watchdog_timeout)) {
-        LOG(ERROR) << "Failed to boot in " << watchdog_timeout.count()
-                   << "ms. Switching to full reboot";
-        // In this case device is in a boot loop. Only way to recover is to do dirty reboot.
-        // Since init might be wedged, don't try to write reboot reason into a persistent property.
-        PersistRebootReason("userspace_failed,watchdog_triggered,failed_to_boot", false);
-        RebootSystem(ANDROID_RB_RESTART2, "userspace_failed,watchdog_triggered,failed_to_boot");
-    }
-    LOG(INFO) << "Device booted, stopping userspace reboot watchdog";
-}
-
-static void HandleUserspaceReboot() {
-    if (!android::sysprop::InitProperties::is_userspace_reboot_supported().value_or(false)) {
-        LOG(ERROR) << "Attempted a userspace reboot on a device that doesn't support it";
-        return;
-    }
-    // Spinnig up a separate thread will fail the setns call later in the boot sequence.
-    // Fork a new process to monitor userspace reboot while we are investigating a better solution.
-    pid_t pid = fork();
-    if (pid < 0) {
-        PLOG(ERROR) << "Failed to fork process for userspace reboot watchdog. Switching to full "
-                    << "reboot";
-        trigger_shutdown("reboot,userspace_failed,watchdog_fork");
-        return;
-    }
-    if (pid == 0) {
-        // Child
-        UserspaceRebootWatchdogThread();
-        _exit(EXIT_SUCCESS);
-    }
-    LOG(INFO) << "Clearing queue and starting userspace-reboot-requested trigger";
-    auto& am = ActionManager::GetInstance();
-    am.ClearQueue();
-    am.QueueEventTrigger("userspace-reboot-requested");
-    auto handler = [](const BuiltinArguments&) { return DoUserspaceReboot(); };
-    am.QueueBuiltinAction(handler, "userspace-reboot");
 }
 
 /**
@@ -959,7 +829,6 @@ void HandlePowerctlMessage(const std::string& command) {
     std::string reboot_target = "";
     bool run_fsck = false;
     bool command_invalid = false;
-    bool userspace_reboot = false;
 
     if (cmd_params[0] == "shutdown") {
         cmd = ANDROID_RB_POWEROFF;
@@ -980,8 +849,8 @@ void HandlePowerctlMessage(const std::string& command) {
         if (cmd_params.size() >= 2) {
             reboot_target = cmd_params[1];
             if (reboot_target == "userspace") {
-                LOG(INFO) << "Userspace reboot requested";
-                userspace_reboot = true;
+                LOG(ERROR) << "Userspace reboot is deprecated.";
+                return;
             }
             // adb reboot fastboot should boot into bootloader for devices not
             // supporting logical partitions.
@@ -1007,6 +876,21 @@ void HandlePowerctlMessage(const std::string& command) {
                 // the other arguments in the bootloader message.
                 if (!CommandIsPresent(&boot)) {
                     strlcpy(boot.command, "boot-recovery", sizeof(boot.command));
+                    if (std::string err; !write_bootloader_message(boot, &err)) {
+                        LOG(ERROR) << "Failed to set bootloader message: " << err;
+                        return;
+                    }
+                }
+            } else if (std::find(cmd_params.begin(), cmd_params.end(), "quiescent")
+                    != cmd_params.end()) { // Quiescent can be either subreason or details.
+                bootloader_message boot = {};
+                if (std::string err; !read_bootloader_message(&boot, &err)) {
+                    LOG(ERROR) << "Failed to read bootloader message: " << err;
+                }
+                // Update the boot command field if it's empty, and preserve
+                // the other arguments in the bootloader message.
+                if (!CommandIsPresent(&boot)) {
+                    strlcpy(boot.command, "boot-quiescent", sizeof(boot.command));
                     if (std::string err; !write_bootloader_message(boot, &err)) {
                         LOG(ERROR) << "Failed to set bootloader message: " << err;
                         return;
@@ -1043,11 +927,6 @@ void HandlePowerctlMessage(const std::string& command) {
     // We do not want to process any messages (queue'ing triggers, shutdown messages, control
     // messages, etc) from properties during reboot.
     StopSendingMessages();
-
-    if (userspace_reboot) {
-        HandleUserspaceReboot();
-        return;
-    }
 
     LOG(INFO) << "Clear action queue and start shutdown trigger";
     ActionManager::GetInstance().ClearQueue();

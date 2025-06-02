@@ -15,10 +15,12 @@
  */
 
 #include "security.h"
+#include "util.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/perf_event.h>
+#include <math.h>
 #include <selinux/selinux.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
@@ -89,7 +91,7 @@ static bool SetMmapRndBitsMin(int start, int min, bool compat) {
 
 // Set /proc/sys/vm/mmap_rnd_bits and potentially
 // /proc/sys/vm/mmap_rnd_compat_bits to the maximum supported values.
-// Returns -1 if unable to set these to an acceptable value.
+// Returns an error if unable to set these to an acceptable value.
 //
 // To support this sysctl, the following upstream commits are needed:
 //
@@ -105,13 +107,26 @@ Result<void> SetMmapRndBitsAction(const BuiltinArguments&) {
     // uml does not support mmap_rnd_bits
     return {};
 #elif defined(__aarch64__)
-    // arm64 supports 18 - 33 bits depending on pagesize and VA_SIZE
-    if (SetMmapRndBitsMin(33, 24, false) && SetMmapRndBitsMin(16, 16, true)) {
+    // arm64 supports 14 - 33 rnd bits depending on page size and ARM64_VA_BITS.
+    // The kernel (6.5) still defaults to 39 va bits for 4KiB pages, so shipping
+    // devices are only getting 24 bits of randomness in practice.
+    if (SetMmapRndBitsMin(33, 24, false) && (!Has32BitAbi() || SetMmapRndBitsMin(16, 16, true))) {
+        return {};
+    }
+#elif defined(__riscv)
+    // riscv64 supports 24 rnd bits with Sv39, and starting with the 6.9 kernel,
+    // 33 bits with Sv48 and Sv57.
+    if (SetMmapRndBitsMin(33, 24, false)) {
         return {};
     }
 #elif defined(__x86_64__)
-    // x86_64 supports 28 - 32 bits
-    if (SetMmapRndBitsMin(32, 32, false) && SetMmapRndBitsMin(16, 16, true)) {
+    // x86_64 supports 28 - 32 rnd bits, but Android wants to ensure that the
+    // theoretical maximum of 32 bits is always supported and used; except in
+    // the case of the x86 page size emulator which supports a maximum
+    // of 30 bits for 16k page size, or 28 bits for 64k page size.
+    int max_bits = 32 - (static_cast<int>(log2(getpagesize())) - 12);
+    if (SetMmapRndBitsMin(max_bits, max_bits, false) &&
+        (!Has32BitAbi() || SetMmapRndBitsMin(16, 16, true))) {
         return {};
     }
 #elif defined(__arm__) || defined(__i386__)
@@ -201,7 +216,7 @@ Result<void> TestPerfEventSelinuxAction(const BuiltinArguments&) {
         return {};
     }
 
-    int ioctl_ret = ioctl(fd, PERF_EVENT_IOC_RESET);
+    int ioctl_ret = ioctl(fd.get(), PERF_EVENT_IOC_RESET);
     if (ioctl_ret != -1) {
         // Success implies that the kernel doesn't have the hooks.
         return {};

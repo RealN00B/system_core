@@ -1,9 +1,5 @@
-arve@google.com
-dkrahn@google.com
-drewry@google.com
-gmar@google.com
-mmaurer@google.com
-ncbray@google.com
+# include OWNERS from the top level trusty repo
+include trusty:main:/OWNERS
+
+mikemcternan@google.com
 swillden@google.com
-trong@google.com
-wenhaowang@google.com

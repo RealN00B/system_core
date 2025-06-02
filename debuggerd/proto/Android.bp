@@ -31,9 +31,25 @@ cc_library_static {
 
     stl: "libc++_static",
     apex_available: [
+        "//apex_available:platform",
         "com.android.runtime",
     ],
 
+    ramdisk_available: true,
     recovery_available: true,
     vendor_ramdisk_available: true,
+    host_supported: true,
+}
+
+java_library_static {
+    name: "libtombstone_proto_java",
+    proto: {
+        type: "lite",
+    },
+    srcs: [
+        "tombstone.proto",
+    ],
+    jarjar_rules: "jarjar-rules.txt",
+    sdk_version: "current",
+    static_libs: ["libprotobuf-java-lite"],
 }

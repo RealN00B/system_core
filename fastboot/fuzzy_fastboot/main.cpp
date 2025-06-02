@@ -43,11 +43,14 @@
 #include <thread>
 #include <vector>
 
+#include <android-base/file.h>
 #include <android-base/parseint.h>
 #include <android-base/stringprintf.h>
+#include <android-base/strings.h>
 #include <gtest/gtest.h>
 #include <sparse/sparse.h>
 
+#include "constants.h"
 #include "fastboot_driver.h"
 #include "usb.h"
 
@@ -164,16 +167,15 @@ TEST(USBFunctionality, USBConnect) {
     const auto matcher = [](usb_ifc_info* info) -> int {
         return FastBootTest::MatchFastboot(info, fastboot::FastBootTest::device_serial);
     };
-    Transport* transport = nullptr;
+    std::unique_ptr<Transport> transport;
     for (int i = 0; i < FastBootTest::MAX_USB_TRIES && !transport; i++) {
         transport = usb_open(matcher);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    ASSERT_NE(transport, nullptr) << "Could not find the fastboot device after: "
-                                  << 10 * FastBootTest::MAX_USB_TRIES << "ms";
+    ASSERT_NE(transport.get(), nullptr) << "Could not find the fastboot device after: "
+                                        << 10 * FastBootTest::MAX_USB_TRIES << "ms";
     if (transport) {
         transport->Close();
-        delete transport;
     }
 }
 
@@ -349,22 +351,35 @@ TEST_F(Conformance, GetVarBattVoltageOk) {
     EXPECT_TRUE(var == "yes" || var == "no") << "getvar:battery-soc-ok must be 'yes' or 'no'";
 }
 
+void AssertHexUint32(const std::string& name, const std::string& var) {
+    ASSERT_NE(var, "") << "getvar:" << name << " responded with empty string";
+    // This must start with 0x
+    ASSERT_FALSE(isspace(var.front()))
+            << "getvar:" << name << " responded with a string with leading whitespace";
+    ASSERT_FALSE(var.compare(0, 2, "0x"))
+            << "getvar:" << name << " responded with a string that does not start with 0x...";
+    int64_t size = strtoll(var.c_str(), nullptr, 16);
+    ASSERT_GT(size, 0) << "'" + var + "' is not a valid response from getvar:" << name;
+    // At most 32-bits
+    ASSERT_LE(size, std::numeric_limits<uint32_t>::max())
+            << "getvar:" << name << " must fit in a uint32_t";
+    ASSERT_LE(var.size(), FB_RESPONSE_SZ - 4)
+            << "getvar:" << name << " responded with too large of string: " + var;
+}
+
 TEST_F(Conformance, GetVarDownloadSize) {
     std::string var;
     EXPECT_EQ(fb->GetVar("max-download-size", &var), SUCCESS) << "getvar:max-download-size failed";
-    EXPECT_NE(var, "") << "getvar:max-download-size responded with empty string";
-    // This must start with 0x
-    EXPECT_FALSE(isspace(var.front()))
-            << "getvar:max-download-size responded with a string with leading whitespace";
-    EXPECT_FALSE(var.compare(0, 2, "0x"))
-            << "getvar:max-download-size responded with a string that does not start with 0x...";
-    int64_t size = strtoll(var.c_str(), nullptr, 16);
-    EXPECT_GT(size, 0) << "'" + var + "' is not a valid response from getvar:max-download-size";
-    // At most 32-bits
-    EXPECT_LE(size, std::numeric_limits<uint32_t>::max())
-            << "getvar:max-download-size must fit in a uint32_t";
-    EXPECT_LE(var.size(), FB_RESPONSE_SZ - 4)
-            << "getvar:max-download-size responded with too large of string: " + var;
+    AssertHexUint32("max-download-size", var);
+}
+
+// If fetch is supported, getvar:max-fetch-size must return a hex string.
+TEST_F(Conformance, GetVarFetchSize) {
+    std::string var;
+    if (SUCCESS != fb->GetVar("max-fetch-size", &var)) {
+        GTEST_SKIP() << "getvar:max-fetch-size failed";
+    }
+    AssertHexUint32("max-fetch-size", var);
 }
 
 TEST_F(Conformance, GetVarAll) {
@@ -656,6 +671,33 @@ TEST_F(UnlockPermissions, DownloadFlash) {
     EXPECT_EQ(fb->Partitions(&parts), SUCCESS) << "getvar:all failed in unlocked mode";
 }
 
+// If the implementation supports getvar:max-fetch-size, it must also support fetch:vendor_boot*.
+TEST_F(UnlockPermissions, FetchVendorBoot) {
+    std::string var;
+    uint64_t fetch_size;
+    if (fb->GetVar("max-fetch-size", &var) != SUCCESS) {
+        GTEST_SKIP() << "This test is skipped because fetch is not supported.";
+    }
+    ASSERT_FALSE(var.empty());
+    ASSERT_TRUE(android::base::ParseUint(var, &fetch_size)) << var << " is not an integer";
+    std::vector<std::tuple<std::string, uint64_t>> parts;
+    EXPECT_EQ(fb->Partitions(&parts), SUCCESS) << "getvar:all failed";
+    for (const auto& [partition, partition_size] : parts) {
+        if (!android::base::StartsWith(partition, "vendor_boot")) continue;
+        TemporaryFile fetched;
+
+        uint64_t offset = 0;
+        while (offset < partition_size) {
+            uint64_t chunk_size = std::min(fetch_size, partition_size - offset);
+            auto ret = fb->FetchToFd(partition, fetched.fd, offset, chunk_size);
+            ASSERT_EQ(fastboot::RetCode::SUCCESS, ret)
+                    << "Unable to fetch " << partition << " (offset=" << offset
+                    << ", size=" << chunk_size << ")";
+            offset += chunk_size;
+        }
+    }
+}
+
 TEST_F(LockPermissions, DownloadFlash) {
     std::vector<char> buf{'a', 'o', 's', 'p'};
     EXPECT_EQ(fb->Download(buf), SUCCESS) << "Download failed in locked mode";
@@ -715,6 +757,16 @@ TEST_F(LockPermissions, Boot) {
     ASSERT_EQ(fb->Boot(&resp), DEVICE_FAIL)
             << "The device did not respond with failure for 'boot' when locked";
     EXPECT_GT(resp.size(), 0) << "No error message was returned by device after FAIL";
+}
+
+TEST_F(LockPermissions, FetchVendorBoot) {
+    std::vector<std::tuple<std::string, uint64_t>> parts;
+    EXPECT_EQ(fb->Partitions(&parts), SUCCESS) << "getvar:all failed";
+    for (const auto& [partition, _] : parts) {
+        TemporaryFile fetched;
+        ASSERT_EQ(fb->FetchToFd(partition, fetched.fd, 0, 0), DEVICE_FAIL)
+                << "fetch:" << partition << ":0:0 did not fail in locked mode";
+    }
 }
 
 TEST_F(Fuzz, DownloadSize) {
@@ -822,6 +874,12 @@ TEST_F(Fuzz, DownloadInvalid8) {
             << "Device did not respond with FAIL for malformed download command '" << cmd << "'";
 }
 
+TEST_F(Fuzz, DownloadInvalid9) {
+    std::string cmd("download:2PPPPPPPPPPPPPPPPPPPPPPPPPPPPPP");
+    EXPECT_EQ(fb->RawCommand(cmd), DEVICE_FAIL)
+            << "Device did not respond with FAIL for malformed download command '" << cmd << "'";
+}
+
 TEST_F(Fuzz, GetVarAllSpam) {
     auto start = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed;
@@ -838,28 +896,50 @@ TEST_F(Fuzz, GetVarAllSpam) {
 
 TEST_F(Fuzz, BadCommandTooLarge) {
     std::string s = RandomString(FB_COMMAND_SZ + 1, rand_legal);
-    EXPECT_EQ(fb->RawCommand(s), DEVICE_FAIL)
+    RetCode ret = fb->RawCommand(s);
+    EXPECT_TRUE(ret == DEVICE_FAIL || ret == IO_ERROR)
             << "Device did not respond with failure after sending length " << s.size()
             << " string of random ASCII chars";
-    std::string s1 = RandomString(1000, rand_legal);
-    EXPECT_EQ(fb->RawCommand(s1), DEVICE_FAIL)
+    if (ret == IO_ERROR) EXPECT_EQ(transport->Reset(), 0) << "USB reset failed";
+    std::string s1 = RandomString(10000, rand_legal);
+    ret = fb->RawCommand(s1);
+    EXPECT_TRUE(ret == DEVICE_FAIL || ret == IO_ERROR)
             << "Device did not respond with failure after sending length " << s1.size()
             << " string of random ASCII chars";
-    std::string s2 = RandomString(1000, rand_illegal);
-    EXPECT_EQ(fb->RawCommand(s2), DEVICE_FAIL)
-            << "Device did not respond with failure after sending length " << s1.size()
+    if (ret == IO_ERROR) EXPECT_EQ(transport->Reset(), 0) << "USB reset failed";
+    std::string s2 = RandomString(10000, rand_illegal);
+    ret = fb->RawCommand(s2);
+    EXPECT_TRUE(ret == DEVICE_FAIL || ret == IO_ERROR)
+            << "Device did not respond with failure after sending length " << s2.size()
             << " string of random non-ASCII chars";
-    std::string s3 = RandomString(1000, rand_char);
-    EXPECT_EQ(fb->RawCommand(s3), DEVICE_FAIL)
-            << "Device did not respond with failure after sending length " << s1.size()
+    if (ret == IO_ERROR) EXPECT_EQ(transport->Reset(), 0) << "USB reset failed";
+    std::string s3 = RandomString(10000, rand_char);
+    ret = fb->RawCommand(s3);
+    EXPECT_TRUE(ret == DEVICE_FAIL || ret == IO_ERROR)
+            << "Device did not respond with failure after sending length " << s3.size()
             << " string of random chars";
+    if (ret == IO_ERROR) EXPECT_EQ(transport->Reset(), 0) << "USB reset failed";
+
+    std::string s4 = RandomString(10 * 1024 * 1024, rand_legal);
+    ret = fb->RawCommand(s);
+    EXPECT_TRUE(ret == DEVICE_FAIL || ret == IO_ERROR)
+            << "Device did not respond with failure after sending length " << s4.size()
+            << " string of random ASCII chars ";
+    if (ret == IO_ERROR) EXPECT_EQ(transport->Reset(), 0) << "USB reset failed";
+
+    ASSERT_TRUE(UsbStillAvailible()) << USB_PORT_GONE;
+    std::string resp;
+    EXPECT_EQ(fb->GetVar("product", &resp), SUCCESS) << "Device is unresponsive to getvar command";
 }
 
 TEST_F(Fuzz, CommandTooLarge) {
     for (const std::string& s : CMDS) {
-        std::string rs = RandomString(1000, rand_char);
-        EXPECT_EQ(fb->RawCommand(s + rs), DEVICE_FAIL)
-                << "Device did not respond with failure after '" << s + rs << "'";
+        std::string rs = RandomString(10000, rand_char);
+        RetCode ret;
+        ret = fb->RawCommand(s + rs);
+        EXPECT_TRUE(ret == DEVICE_FAIL || ret == IO_ERROR)
+                << "Device did not respond with failure " << ret << "after '" << s + rs << "'";
+        if (ret == IO_ERROR) EXPECT_EQ(transport->Reset(), 0) << "USB reset failed";
         ASSERT_TRUE(UsbStillAvailible()) << USB_PORT_GONE;
         std::string resp;
         EXPECT_EQ(fb->GetVar("product", &resp), SUCCESS)
@@ -899,6 +979,74 @@ TEST_F(Fuzz, SparseZeroLength) {
     if (ret != DEVICE_FAIL) {  // if lazily parsed it better fail on a flash
         EXPECT_EQ(fb->Flash("userdata"), DEVICE_FAIL)
                 << "Flashing zero length sparse image did not fail " << sparse.Rep();
+    }
+}
+
+TEST_F(Fuzz, SparseZeroBlkSize) {
+    // handcrafted malform sparse file with zero as block size
+    const std::vector<char> buf = {
+            '\x3a', '\xff', '\x26', '\xed', '\x01', '\x00', '\x00', '\x00', '\x1c', '\x00', '\x0c',
+            '\x00', '\x00', '\x00', '\x00', '\x00', '\x01', '\x00', '\x00', '\x00', '\x01', '\x00',
+            '\x00', '\x00', '\x00', '\x00', '\x00', '\x00', '\xc2', '\xca', '\x00', '\x00', '\x01',
+            '\x00', '\x00', '\x00', '\x10', '\x00', '\x00', '\x00', '\x11', '\x22', '\x33', '\x44'};
+
+    ASSERT_EQ(DownloadCommand(buf.size()), SUCCESS) << "Device rejected download command";
+    ASSERT_EQ(SendBuffer(buf), SUCCESS) << "Downloading payload failed";
+
+    // It can either reject this download or reject it during flash
+    if (HandleResponse() != DEVICE_FAIL) {
+        EXPECT_EQ(fb->Flash("userdata"), DEVICE_FAIL)
+                << "Flashing a zero block size in sparse file should fail";
+    }
+}
+
+TEST_F(Fuzz, SparseVeryLargeBlkSize) {
+    // handcrafted sparse file with block size of ~4GB and divisible 4
+    const std::vector<char> buf = {
+            '\x3a', '\xff', '\x26', '\xed', '\x01', '\x00', '\x00', '\x00', '\x1c', '\x00', '\x0c',
+            '\x00', '\xF0', '\xFF', '\xFF', '\xFF', '\x01', '\x00', '\x00', '\x00', '\x01', '\x00',
+            '\x00', '\x00', '\x00', '\x00', '\x00', '\x00', '\xc3', '\xca', '\x00', '\x00', '\x01',
+            '\x00', '\x00', '\x00', '\x0c', '\x00', '\x00', '\x00', '\x11', '\x22', '\x33', '\x44'};
+
+    ASSERT_EQ(DownloadCommand(buf.size()), SUCCESS) << "Device rejected download command";
+    ASSERT_EQ(SendBuffer(buf), SUCCESS) << "Downloading payload failed";
+    ASSERT_EQ(HandleResponse(), SUCCESS) << "Not receive okay";
+    ASSERT_EQ(fb->Flash("userdata"), SUCCESS) << "Flashing sparse failed";
+}
+
+TEST_F(Fuzz, SparseTrimmed) {
+    // handcrafted malform sparse file which is trimmed
+    const std::vector<char> buf = {
+            '\x3a', '\xff', '\x26', '\xed', '\x01', '\x00', '\x00', '\x00', '\x1c', '\x00', '\x0c',
+            '\x00', '\x00', '\x10', '\x00', '\x00', '\x00', '\x00', '\x08', '\x00', '\x01', '\x00',
+            '\x00', '\x00', '\x00', '\x00', '\x00', '\x00', '\xc1', '\xca', '\x00', '\x00', '\x01',
+            '\x00', '\x00', '\x00', '\x00', '\x00', '\x00', '\x80', '\x11', '\x22', '\x33', '\x44'};
+
+    ASSERT_EQ(DownloadCommand(buf.size()), SUCCESS) << "Device rejected download command";
+    ASSERT_EQ(SendBuffer(buf), SUCCESS) << "Downloading payload failed";
+
+    // It can either reject this download or reject it during flash
+    if (HandleResponse() != DEVICE_FAIL) {
+        EXPECT_EQ(fb->Flash("userdata"), DEVICE_FAIL)
+                << "Flashing a trimmed sparse file should fail";
+    }
+}
+
+TEST_F(Fuzz, SparseInvalidChurk) {
+    // handcrafted malform sparse file with invalid churk
+    const std::vector<char> buf = {
+            '\x3a', '\xff', '\x26', '\xed', '\x01', '\x00', '\x00', '\x00', '\x1c', '\x00', '\x0c',
+            '\x00', '\x00', '\x10', '\x00', '\x00', '\x00', '\x00', '\x08', '\x00', '\x01', '\x00',
+            '\x00', '\x00', '\x00', '\x00', '\x00', '\x00', '\xc1', '\xca', '\x00', '\x00', '\x01',
+            '\x00', '\x00', '\x00', '\x10', '\x00', '\x00', '\x00', '\x11', '\x22', '\x33', '\x44'};
+
+    ASSERT_EQ(DownloadCommand(buf.size()), SUCCESS) << "Device rejected download command";
+    ASSERT_EQ(SendBuffer(buf), SUCCESS) << "Downloading payload failed";
+
+    // It can either reject this download or reject it during flash
+    if (HandleResponse() != DEVICE_FAIL) {
+        EXPECT_EQ(fb->Flash("userdata"), DEVICE_FAIL)
+                << "Flashing a sparse file with invalid churk should fail";
     }
 }
 
@@ -1740,9 +1888,10 @@ int main(int argc, char** argv) {
     if (!fastboot::FastBootTest::IsFastbootOverTcp()) {
         printf("<Waiting for Device>\n");
         const auto matcher = [](usb_ifc_info* info) -> int {
-            return fastboot::FastBootTest::MatchFastboot(info, fastboot::FastBootTest::device_serial);
+            return fastboot::FastBootTest::MatchFastboot(info,
+                                                         fastboot::FastBootTest::device_serial);
         };
-        Transport* transport = nullptr;
+        std::unique_ptr<Transport> transport;
         while (!transport) {
             transport = usb_open(matcher);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));

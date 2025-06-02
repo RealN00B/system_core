@@ -1,25 +1,17 @@
 /*
  * Copyright (C) 2018 The Android Open Source Project
  *
- * Permission is hereby granted, free of charge, to any person
- * obtaining a copy of this software and associated documentation
- * files (the "Software"), to deal in the Software without
- * restriction, including without limitation the rights to use, copy,
- * modify, merge, publish, distribute, sublicense, and/or sell copies
- * of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
+ *      http://www.apache.org/licenses/LICENSE-2.0
  *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #define LOG_TAG "rpmb_mock"
@@ -27,6 +19,7 @@
 #include "rpmb_protocol.h"
 
 #include <assert.h>
+#include <cutils/sockets.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -621,20 +614,24 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    cmdres_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    cmdres_sock = android_get_control_socket(socket_path);
     if (cmdres_sock < 0) {
-        ALOGE("rpmb_dev: Failed to create command/response socket: %s\n", strerror(errno));
-        return EXIT_FAILURE;
-    }
+        ALOGW("android_get_control_socket(%s) failed, fall back to create it\n", socket_path);
+        cmdres_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (cmdres_sock < 0) {
+            ALOGE("rpmb_dev: Failed to create command/response socket: %s\n", strerror(errno));
+            return EXIT_FAILURE;
+        }
 
-    cmdres_sockaddr.sun_family = AF_UNIX;
-    strncpy(cmdres_sockaddr.sun_path, socket_path, sizeof(cmdres_sockaddr.sun_path));
+        cmdres_sockaddr.sun_family = AF_UNIX;
+        strncpy(cmdres_sockaddr.sun_path, socket_path, sizeof(cmdres_sockaddr.sun_path));
 
-    ret = bind(cmdres_sock, (struct sockaddr*)&cmdres_sockaddr, sizeof(struct sockaddr_un));
-    if (ret < 0) {
-        ALOGE("rpmb_dev: Failed to bind command/response socket: %s: %s\n", socket_path,
-              strerror(errno));
-        return EXIT_FAILURE;
+        ret = bind(cmdres_sock, (struct sockaddr*)&cmdres_sockaddr, sizeof(struct sockaddr_un));
+        if (ret < 0) {
+            ALOGE("rpmb_dev: Failed to bind command/response socket: %s: %s\n", socket_path,
+                  strerror(errno));
+            return EXIT_FAILURE;
+        }
     }
 
     ret = listen(cmdres_sock, 1);

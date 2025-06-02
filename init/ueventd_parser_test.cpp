@@ -45,6 +45,14 @@ void TestSysfsPermissions(const SysfsPermissions& expected, const SysfsPermissio
     EXPECT_EQ(expected.attribute_, test.attribute_);
 }
 
+void TestExternalFirmwareHandler(const ExternalFirmwareHandler& expected,
+                                 const ExternalFirmwareHandler& test) {
+    EXPECT_EQ(expected.devpath, test.devpath) << expected.devpath;
+    EXPECT_EQ(expected.uid, test.uid) << expected.uid;
+    EXPECT_EQ(expected.gid, test.gid) << expected.gid;
+    EXPECT_EQ(expected.handler_path, test.handler_path) << expected.handler_path;
+}
+
 template <typename T, typename F>
 void TestVector(const T& expected, const T& test, F function) {
     ASSERT_EQ(expected.size(), test.size());
@@ -67,6 +75,9 @@ void TestUeventdFile(const std::string& content, const UeventdConfiguration& exp
     TestVector(expected.sysfs_permissions, result.sysfs_permissions, TestSysfsPermissions);
     TestVector(expected.dev_permissions, result.dev_permissions, TestPermissions);
     EXPECT_EQ(expected.firmware_directories, result.firmware_directories);
+    TestVector(expected.external_firmware_handlers, result.external_firmware_handlers,
+               TestExternalFirmwareHandler);
+    EXPECT_EQ(expected.parallel_restorecon_dirs, result.parallel_restorecon_dirs);
 }
 
 TEST(ueventd_parser, EmptyFile) {
@@ -95,7 +106,32 @@ subsystem test_devpath_dirname
             {"test_devname2", Subsystem::DEVNAME_UEVENT_DEVNAME, "/dev"},
             {"test_devpath_dirname", Subsystem::DEVNAME_UEVENT_DEVPATH, "/dev/graphics"}};
 
-    TestUeventdFile(ueventd_file, {subsystems, {}, {}, {}, {}});
+    TestUeventdFile(ueventd_file, {subsystems, {}, {}, {}, {}, {}, {}});
+}
+
+TEST(ueventd_parser, Drivers) {
+    auto ueventd_file = R"(
+driver test_devname
+    devname uevent_devname
+
+driver test_devpath_no_dirname
+    devname uevent_devpath
+
+driver test_devname2
+    devname uevent_devname
+
+driver test_devpath_dirname
+    devname uevent_devpath
+    dirname /dev/graphics
+)";
+
+    auto drivers = std::vector<Subsystem>{
+            {"test_devname", Subsystem::DEVNAME_UEVENT_DEVNAME, "/dev"},
+            {"test_devpath_no_dirname", Subsystem::DEVNAME_UEVENT_DEVPATH, "/dev"},
+            {"test_devname2", Subsystem::DEVNAME_UEVENT_DEVNAME, "/dev"},
+            {"test_devpath_dirname", Subsystem::DEVNAME_UEVENT_DEVPATH, "/dev/graphics"}};
+
+    TestUeventdFile(ueventd_file, {{}, drivers, {}, {}, {}, {}, {}, {}});
 }
 
 TEST(ueventd_parser, Permissions) {
@@ -121,7 +157,7 @@ TEST(ueventd_parser, Permissions) {
             {"/sys/devices/virtual/*/input", "poll_delay", 0660, AID_ROOT, AID_INPUT, true},
     };
 
-    TestUeventdFile(ueventd_file, {{}, sysfs_permissions, permissions, {}, {}});
+    TestUeventdFile(ueventd_file, {{}, {}, sysfs_permissions, permissions, {}, {}, {}});
 }
 
 TEST(ueventd_parser, FirmwareDirectories) {
@@ -137,35 +173,73 @@ firmware_directories /more
             "/more",
     };
 
-    TestUeventdFile(ueventd_file, {{}, {}, {}, firmware_directories, {}});
+    TestUeventdFile(ueventd_file, {{}, {}, {}, {}, firmware_directories, {}, {}});
 }
 
 TEST(ueventd_parser, ExternalFirmwareHandlers) {
     auto ueventd_file = R"(
 external_firmware_handler devpath root handler_path
 external_firmware_handler /devices/path/firmware/something001.bin system /vendor/bin/firmware_handler.sh
-external_firmware_handler /devices/path/firmware/something001.bin radio "/vendor/bin/firmware_handler.sh --has --arguments"
+external_firmware_handler /devices/path/firmware/something002.bin radio "/vendor/bin/firmware_handler.sh --has --arguments"
+external_firmware_handler /devices/path/firmware/* root "/vendor/bin/firmware_handler.sh"
+external_firmware_handler /devices/path/firmware/something* system "/vendor/bin/firmware_handler.sh"
+external_firmware_handler /devices/path/*/firmware/something*.bin radio "/vendor/bin/firmware_handler.sh"
+external_firmware_handler /devices/path/firmware/something003.bin system system /vendor/bin/firmware_handler.sh
+external_firmware_handler /devices/path/firmware/something004.bin radio radio "/vendor/bin/firmware_handler.sh --has --arguments"
 )";
 
     auto external_firmware_handlers = std::vector<ExternalFirmwareHandler>{
             {
                     "devpath",
                     AID_ROOT,
+                    AID_ROOT,
                     "handler_path",
             },
             {
                     "/devices/path/firmware/something001.bin",
                     AID_SYSTEM,
+                    AID_ROOT,
                     "/vendor/bin/firmware_handler.sh",
             },
             {
-                    "/devices/path/firmware/something001.bin",
+                    "/devices/path/firmware/something002.bin",
+                    AID_RADIO,
+                    AID_ROOT,
+                    "/vendor/bin/firmware_handler.sh --has --arguments",
+            },
+            {
+                    "/devices/path/firmware/",
+                    AID_ROOT,
+                    AID_ROOT,
+                    "/vendor/bin/firmware_handler.sh",
+            },
+            {
+                    "/devices/path/firmware/something",
+                    AID_SYSTEM,
+                    AID_ROOT,
+                    "/vendor/bin/firmware_handler.sh",
+            },
+            {
+                    "/devices/path/*/firmware/something*.bin",
+                    AID_RADIO,
+                    AID_ROOT,
+                    "/vendor/bin/firmware_handler.sh",
+            },
+            {
+                    "/devices/path/firmware/something003.bin",
+                    AID_SYSTEM,
+                    AID_SYSTEM,
+                    "/vendor/bin/firmware_handler.sh",
+            },
+            {
+                    "/devices/path/firmware/something004.bin",
+                    AID_RADIO,
                     AID_RADIO,
                     "/vendor/bin/firmware_handler.sh --has --arguments",
             },
     };
 
-    TestUeventdFile(ueventd_file, {{}, {}, {}, {}, external_firmware_handlers});
+    TestUeventdFile(ueventd_file, {{}, {}, {}, {}, {}, external_firmware_handlers, {}});
 }
 
 TEST(ueventd_parser, ExternalFirmwareHandlersDuplicate) {
@@ -178,11 +252,26 @@ external_firmware_handler devpath root handler_path2
             {
                     "devpath",
                     AID_ROOT,
+                    AID_ROOT,
                     "handler_path",
             },
     };
 
-    TestUeventdFile(ueventd_file, {{}, {}, {}, {}, external_firmware_handlers});
+    TestUeventdFile(ueventd_file, {{}, {}, {}, {}, {}, external_firmware_handlers, {}});
+}
+
+TEST(ueventd_parser, ParallelRestoreconDirs) {
+    auto ueventd_file = R"(
+parallel_restorecon_dir /sys
+parallel_restorecon_dir /sys/devices
+)";
+
+    auto parallel_restorecon_dirs = std::vector<std::string>{
+            "/sys",
+            "/sys/devices",
+    };
+
+    TestUeventdFile(ueventd_file, {{}, {}, {}, {}, {}, {}, parallel_restorecon_dirs});
 }
 
 TEST(ueventd_parser, UeventSocketRcvbufSize) {
@@ -191,7 +280,7 @@ uevent_socket_rcvbuf_size 8k
 uevent_socket_rcvbuf_size 8M
 )";
 
-    TestUeventdFile(ueventd_file, {{}, {}, {}, {}, {}, false, 8 * 1024 * 1024});
+    TestUeventdFile(ueventd_file, {{}, {}, {}, {}, {}, {}, {}, false, 8 * 1024 * 1024});
 }
 
 TEST(ueventd_parser, EnabledDisabledLines) {
@@ -201,7 +290,7 @@ parallel_restorecon enabled
 modalias_handling disabled
 )";
 
-    TestUeventdFile(ueventd_file, {{}, {}, {}, {}, {}, false, 0, true});
+    TestUeventdFile(ueventd_file, {{}, {}, {}, {}, {}, {}, {}, false, 0, true});
 
     auto ueventd_file2 = R"(
 parallel_restorecon enabled
@@ -209,7 +298,7 @@ modalias_handling enabled
 parallel_restorecon disabled
 )";
 
-    TestUeventdFile(ueventd_file2, {{}, {}, {}, {}, {}, true, 0, false});
+    TestUeventdFile(ueventd_file2, {{}, {}, {}, {}, {}, {}, {}, true, 0, false});
 }
 
 TEST(ueventd_parser, AllTogether) {
@@ -221,6 +310,9 @@ firmware_directories /first/ /second /third
 
 subsystem test_devname
     devname uevent_devname
+
+driver d_test_devpath
+    devname uevent_devpath
 
 /dev/graphics/*           0660   root       graphics
 
@@ -239,6 +331,10 @@ subsystem test_devpath_dirname
     devname uevent_devpath
     dirname /dev/graphics
 
+driver d_test_devname_dirname
+    devname uevent_devname
+    dirname /dev/sound
+
 /dev/*/test               0660   root       system
 /sys/devices/virtual/*/input   poll_delay  0660  root   input    no_fnm_pathname
 firmware_directories /more
@@ -249,6 +345,9 @@ uevent_socket_rcvbuf_size 6M
 modalias_handling enabled
 parallel_restorecon enabled
 
+parallel_restorecon_dir /sys
+parallel_restorecon_dir /sys/devices
+
 #ending comment
 )";
 
@@ -257,6 +356,10 @@ parallel_restorecon enabled
             {"test_devpath_no_dirname", Subsystem::DEVNAME_UEVENT_DEVPATH, "/dev"},
             {"test_devname2", Subsystem::DEVNAME_UEVENT_DEVNAME, "/dev"},
             {"test_devpath_dirname", Subsystem::DEVNAME_UEVENT_DEVPATH, "/dev/graphics"}};
+
+    auto drivers = std::vector<Subsystem>{
+            {"d_test_devpath", Subsystem::DEVNAME_UEVENT_DEVPATH, "/dev"},
+            {"d_test_devname_dirname", Subsystem::DEVNAME_UEVENT_DEVNAME, "/dev/graphics"}};
 
     auto permissions = std::vector<Permissions>{
             {"/dev/rtc0", 0640, AID_SYSTEM, AID_SYSTEM, false},
@@ -278,14 +381,20 @@ parallel_restorecon enabled
     };
 
     auto external_firmware_handlers = std::vector<ExternalFirmwareHandler>{
-            {"/devices/path/firmware/firmware001.bin", AID_ROOT, "/vendor/bin/touch.sh"},
+            {"/devices/path/firmware/firmware001.bin", AID_ROOT, AID_ROOT, "/vendor/bin/touch.sh"},
+    };
+
+    auto parallel_restorecon_dirs = std::vector<std::string>{
+            "/sys",
+            "/sys/devices",
     };
 
     size_t uevent_socket_rcvbuf_size = 6 * 1024 * 1024;
 
     TestUeventdFile(ueventd_file,
-                    {subsystems, sysfs_permissions, permissions, firmware_directories,
-                     external_firmware_handlers, true, uevent_socket_rcvbuf_size, true});
+                    {subsystems, drivers, sysfs_permissions, permissions, firmware_directories,
+                     external_firmware_handlers, parallel_restorecon_dirs, true,
+                     uevent_socket_rcvbuf_size, true});
 }
 
 // All of these lines are ill-formed, so test that there is 0 output.
@@ -316,6 +425,9 @@ parallel_restorecon blah
 external_firmware_handler
 external_firmware_handler blah blah
 external_firmware_handler blah blah blah blah
+
+parallel_restorecon_dir
+parallel_restorecon_dir /sys /sys/devices
 
 )";
 

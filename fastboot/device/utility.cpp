@@ -36,7 +36,6 @@
 using namespace android::fs_mgr;
 using namespace std::chrono_literals;
 using android::base::unique_fd;
-using android::hardware::boot::V1_0::Slot;
 
 namespace {
 
@@ -77,7 +76,8 @@ bool OpenLogicalPartition(FastbootDevice* device, const std::string& partition_n
 
 }  // namespace
 
-bool OpenPartition(FastbootDevice* device, const std::string& name, PartitionHandle* handle) {
+bool OpenPartition(FastbootDevice* device, const std::string& name, PartitionHandle* handle,
+                   int flags) {
     // We prioritize logical partitions over physical ones, and do this
     // consistently for other partition operations (like getvar:partition-size).
     if (LogicalPartitionExists(device, name)) {
@@ -89,13 +89,7 @@ bool OpenPartition(FastbootDevice* device, const std::string& name, PartitionHan
         return false;
     }
 
-    unique_fd fd(TEMP_FAILURE_RETRY(open(handle->path().c_str(), O_WRONLY | O_EXCL)));
-    if (fd < 0) {
-        PLOG(ERROR) << "Failed to open block device: " << handle->path();
-        return false;
-    }
-    handle->set_fd(std::move(fd));
-    return true;
+    return handle->Open(flags);
 }
 
 std::optional<std::string> FindPhysicalPartition(const std::string& name) {
@@ -142,7 +136,7 @@ bool LogicalPartitionExists(FastbootDevice* device, const std::string& name, boo
     return true;
 }
 
-bool GetSlotNumber(const std::string& slot, Slot* number) {
+bool GetSlotNumber(const std::string& slot, int32_t* number) {
     if (slot.size() != 1) {
         return false;
     }
@@ -201,12 +195,7 @@ std::vector<std::string> ListPartitions(FastbootDevice* device) {
 }
 
 bool GetDeviceLockStatus() {
-    std::string cmdline;
-    // Return lock status true if unable to read kernel command line.
-    if (!android::base::ReadFileToString("/proc/cmdline", &cmdline)) {
-        return true;
-    }
-    return cmdline.find("androidboot.verifiedbootstate=orange") == std::string::npos;
+    return android::base::GetProperty("ro.boot.verifiedbootstate", "") != "orange";
 }
 
 bool UpdateAllPartitionMetadata(FastbootDevice* device, const std::string& super_name,
@@ -214,7 +203,7 @@ bool UpdateAllPartitionMetadata(FastbootDevice* device, const std::string& super
     size_t num_slots = 1;
     auto boot_control_hal = device->boot_control_hal();
     if (boot_control_hal) {
-        num_slots = boot_control_hal->getNumberSlots();
+        num_slots = boot_control_hal->GetNumSlots();
     }
 
     bool ok = true;

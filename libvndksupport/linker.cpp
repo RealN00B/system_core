@@ -39,7 +39,7 @@ struct VendorNamespace {
 
 static VendorNamespace get_vendor_namespace() {
     static VendorNamespace result = ([] {
-        for (const char* name : {"sphal", "default"}) {
+        for (const char* name : {"sphal", "vendor", "default"}) {
             if (android_namespace_t* ns = android_get_exported_namespace(name)) {
                 return VendorNamespace{ns, name};
             }
@@ -75,7 +75,7 @@ void* android_load_sphal_library(const char* name, int flag) {
         }
         return handle;
     } else {
-        ALOGD("Loading %s from current namespace instead of sphal namespace.", name);
+        ALOGW("Loading %s from current namespace instead of sphal namespace.", name);
         return dlopen(name, flag);
     }
 }

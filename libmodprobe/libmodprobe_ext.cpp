@@ -54,6 +54,8 @@ bool Modprobe::Insmod(const std::string& path_name, const std::string& parameter
     if (ret != 0) {
         if (errno == EEXIST) {
             // Module already loaded
+            std::lock_guard guard(module_loaded_lock_);
+            module_loaded_paths_.emplace(path_name);
             module_loaded_.emplace(canonical_name);
             return true;
         }
@@ -62,6 +64,8 @@ bool Modprobe::Insmod(const std::string& path_name, const std::string& parameter
     }
 
     LOG(INFO) << "Loaded kernel module " << path_name;
+    std::lock_guard guard(module_loaded_lock_);
+    module_loaded_paths_.emplace(path_name);
     module_loaded_.emplace(canonical_name);
     module_count_++;
     return true;
@@ -74,12 +78,13 @@ bool Modprobe::Rmmod(const std::string& module_name) {
         PLOG(ERROR) << "Failed to remove module '" << module_name << "'";
         return false;
     }
+    std::lock_guard guard(module_loaded_lock_);
     module_loaded_.erase(canonical_name);
     return true;
 }
 
 bool Modprobe::ModuleExists(const std::string& module_name) {
-    struct stat fileStat;
+    struct stat fileStat {};
     if (blocklist_enabled && module_blocklist_.count(module_name)) {
         LOG(INFO) << "module " << module_name << " is blocklisted";
         return false;
@@ -90,7 +95,7 @@ bool Modprobe::ModuleExists(const std::string& module_name) {
         return false;
     }
     if (stat(deps.front().c_str(), &fileStat)) {
-        LOG(INFO) << "module " << module_name << " does not exist";
+        PLOG(INFO) << "module " << module_name << " can't be loaded; can't access " << deps.front();
         return false;
     }
     if (!S_ISREG(fileStat.st_mode)) {

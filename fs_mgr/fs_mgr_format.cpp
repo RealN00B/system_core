@@ -32,9 +32,10 @@
 #include <selinux/android.h>
 #include <selinux/label.h>
 #include <selinux/selinux.h>
+#include <filesystem>
+#include <string>
 
 #include "fs_mgr_priv.h"
-#include "cryptfs.h"
 
 using android::base::unique_fd;
 
@@ -58,7 +59,7 @@ static int get_dev_sz(const std::string& fs_blkdev, uint64_t* dev_sz) {
 }
 
 static int format_ext4(const std::string& fs_blkdev, const std::string& fs_mnt_point,
-                       bool crypt_footer, bool needs_projid, bool needs_metadata_csum) {
+                       bool needs_projid, bool needs_metadata_csum) {
     uint64_t dev_sz;
     int rc = 0;
 
@@ -68,10 +69,14 @@ static int format_ext4(const std::string& fs_blkdev, const std::string& fs_mnt_p
     }
 
     /* Format the partition using the calculated length */
-    if (crypt_footer) {
-        dev_sz -= CRYPT_FOOTER_OFFSET;
-    }
 
+    // EXT4 supports 4K block size on 16K page sizes. A 4K block
+    // size formatted EXT4 partition will mount fine on both 4K and 16K page
+    // size kernels.
+    // However, EXT4 does not support 16K block size on 4K systems.
+    // If we want the same userspace code to work on both 4k/16k kernels,
+    // using a hardcoded 4096 block size is a simple solution. Using
+    // getpagesize() here would work as well, but 4096 is simpler.
     std::string size_str = std::to_string(dev_sz / 4096);
 
     std::vector<const char*> mke2fs_args = {"/system/bin/mke2fs", "-t", "ext4", "-b", "4096"};
@@ -120,8 +125,10 @@ static int format_ext4(const std::string& fs_blkdev, const std::string& fs_mnt_p
     return rc;
 }
 
-static int format_f2fs(const std::string& fs_blkdev, uint64_t dev_sz, bool crypt_footer,
-                       bool needs_projid, bool needs_casefold, bool fs_compress) {
+static int format_f2fs(const std::string& fs_blkdev, uint64_t dev_sz, bool needs_projid,
+                       bool needs_casefold, bool fs_compress, bool is_zoned,
+                       const std::vector<std::string>& user_devices,
+                       const std::vector<int>& device_aliased) {
     if (!dev_sz) {
         int rc = get_dev_sz(fs_blkdev, &dev_sz);
         if (rc) {
@@ -130,11 +137,9 @@ static int format_f2fs(const std::string& fs_blkdev, uint64_t dev_sz, bool crypt
     }
 
     /* Format the partition using the calculated length */
-    if (crypt_footer) {
-        dev_sz -= CRYPT_FOOTER_OFFSET;
-    }
 
-    std::string size_str = std::to_string(dev_sz / 4096);
+    const auto size_str = std::to_string(dev_sz / getpagesize());
+    std::string block_size = std::to_string(getpagesize());
 
     std::vector<const char*> args = {"/system/bin/make_f2fs", "-g", "android"};
     if (needs_projid) {
@@ -153,28 +158,50 @@ static int format_f2fs(const std::string& fs_blkdev, uint64_t dev_sz, bool crypt
         args.push_back("-O");
         args.push_back("extra_attr");
     }
-    args.push_back(fs_blkdev.c_str());
-    args.push_back(size_str.c_str());
+    args.push_back("-w");
+    args.push_back(block_size.c_str());
+    args.push_back("-b");
+    args.push_back(block_size.c_str());
 
+    if (is_zoned) {
+        args.push_back("-m");
+    }
+    for (size_t i = 0; i < user_devices.size(); i++) {
+        std::string device_name = user_devices[i];
+
+        args.push_back("-c");
+        if (device_aliased[i]) {
+            std::filesystem::path path = device_name;
+            device_name += "@" + path.filename().string();
+        }
+        args.push_back(device_name.c_str());
+    }
+
+    if (user_devices.empty()) {
+        args.push_back(fs_blkdev.c_str());
+        args.push_back(size_str.c_str());
+    } else {
+        args.push_back(fs_blkdev.c_str());
+    }
     return logwrap_fork_execvp(args.size(), args.data(), nullptr, false, LOG_KLOG, false, nullptr);
 }
 
-int fs_mgr_do_format(const FstabEntry& entry, bool crypt_footer) {
+int fs_mgr_do_format(const FstabEntry& entry) {
     LERROR << __FUNCTION__ << ": Format " << entry.blk_device << " as '" << entry.fs_type << "'";
 
     bool needs_casefold = false;
-    bool needs_projid = false;
+    bool needs_projid = true;
 
     if (entry.mount_point == "/data") {
         needs_casefold = android::base::GetBoolProperty("external_storage.casefold.enabled", false);
-        needs_projid = android::base::GetBoolProperty("external_storage.projid.enabled", false);
     }
 
     if (entry.fs_type == "f2fs") {
-        return format_f2fs(entry.blk_device, entry.length, crypt_footer, needs_projid,
-                           needs_casefold, entry.fs_mgr_flags.fs_compress);
+        return format_f2fs(entry.blk_device, entry.length, needs_projid, needs_casefold,
+                           entry.fs_mgr_flags.fs_compress, entry.fs_mgr_flags.is_zoned,
+                           entry.user_devices, entry.device_aliased);
     } else if (entry.fs_type == "ext4") {
-        return format_ext4(entry.blk_device, entry.mount_point, crypt_footer, needs_projid,
+        return format_ext4(entry.blk_device, entry.mount_point, needs_projid,
                            entry.fs_mgr_flags.ext_meta_csum);
     } else {
         LERROR << "File system type '" << entry.fs_type << "' is not supported";

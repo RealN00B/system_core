@@ -27,13 +27,18 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/stringprintf.h>
+#include <android/avf_cc_flags.h>
+#include <fs_mgr.h>
 #include <modprobe/modprobe.h>
 #include <private/android_filesystem_config.h>
 
@@ -57,10 +62,16 @@ namespace init {
 
 namespace {
 
+enum class BootMode {
+    NORMAL_MODE,
+    RECOVERY_MODE,
+    CHARGER_MODE,
+};
+
 void FreeRamdisk(DIR* dir, dev_t dev) {
     int dfd = dirfd(dir);
 
-    dirent* de;
+    dirent* de = nullptr;
     while ((de = readdir(dir)) != nullptr) {
         if (de->d_name == "."s || de->d_name == ".."s) {
             continue;
@@ -69,7 +80,7 @@ void FreeRamdisk(DIR* dir, dev_t dev) {
         bool is_dir = false;
 
         if (de->d_type == DT_DIR || de->d_type == DT_UNKNOWN) {
-            struct stat info;
+            struct stat info {};
             if (fstatat(dfd, de->d_name, &info, AT_SYMLINK_NOFOLLOW) != 0) {
                 continue;
             }
@@ -102,19 +113,97 @@ void FreeRamdisk(DIR* dir, dev_t dev) {
     }
 }
 
-bool ForceNormalBoot(const std::string& cmdline) {
-    return cmdline.find("androidboot.force_normal_boot=1") != std::string::npos;
+bool ForceNormalBoot(const std::string& cmdline, const std::string& bootconfig) {
+    return bootconfig.find("androidboot.force_normal_boot = \"1\"") != std::string::npos ||
+           cmdline.find("androidboot.force_normal_boot=1") != std::string::npos;
+}
+
+static void Copy(const char* src, const char* dst) {
+    if (link(src, dst) == 0) {
+        LOG(INFO) << "hard linking " << src << " to " << dst << " succeeded";
+        return;
+    }
+    PLOG(FATAL) << "hard linking " << src << " to " << dst << " failed";
+}
+
+// Move snapuserd before switching root, so that it is available at the same path
+// after switching root.
+void PrepareSwitchRoot() {
+    static constexpr const auto& snapuserd = "/system/bin/snapuserd";
+    static constexpr const auto& snapuserd_ramdisk = "/system/bin/snapuserd_ramdisk";
+    static constexpr const auto& dst = "/first_stage_ramdisk/system/bin/snapuserd";
+
+    if (access(dst, X_OK) == 0) {
+        LOG(INFO) << dst << " already exists and it can be executed";
+        return;
+    }
+    auto dst_dir = android::base::Dirname(dst);
+    std::error_code ec;
+    if (access(dst_dir.c_str(), F_OK) != 0) {
+        if (!fs::create_directories(dst_dir, ec)) {
+            LOG(FATAL) << "Cannot create " << dst_dir << ": " << ec.message();
+        }
+    }
+
+    // prefer the generic ramdisk copy of snapuserd, because that's on system side of treble
+    // boundary, and therefore is more likely to be updated along with the Android platform.
+    // The vendor ramdisk copy might be under vendor freeze, or vendor might choose not to update
+    // it.
+    if (access(snapuserd_ramdisk, F_OK) == 0) {
+        LOG(INFO) << "Using generic ramdisk copy of snapuserd " << snapuserd_ramdisk;
+        Copy(snapuserd_ramdisk, dst);
+    } else if (access(snapuserd, F_OK) == 0) {
+        LOG(INFO) << "Using vendor ramdisk copy of snapuserd " << snapuserd;
+        Copy(snapuserd, dst);
+    }
+}
+
+std::string GetPageSizeSuffix() {
+    static const size_t page_size = sysconf(_SC_PAGE_SIZE);
+    if (page_size <= 4096) {
+        return "";
+    }
+    return android::base::StringPrintf("_%zuk", page_size / 1024);
+}
+
+constexpr bool EndsWith(const std::string_view str, const std::string_view suffix) {
+    return str.size() >= suffix.size() &&
+           0 == str.compare(str.size() - suffix.size(), suffix.size(), suffix);
+}
+
+constexpr std::string_view GetPageSizeSuffix(std::string_view dirname) {
+    if (EndsWith(dirname, "_16k")) {
+        return "_16k";
+    }
+    if (EndsWith(dirname, "_64k")) {
+        return "_64k";
+    }
+    return "";
 }
 
 }  // namespace
 
-std::string GetModuleLoadList(bool recovery, const std::string& dir_path) {
-    auto module_load_file = "modules.load";
-    if (recovery) {
-        struct stat fileStat;
-        std::string recovery_load_path = dir_path + "/modules.load.recovery";
-        if (!stat(recovery_load_path.c_str(), &fileStat)) {
+std::string GetModuleLoadList(BootMode boot_mode, const std::string& dir_path) {
+    std::string module_load_file;
+
+    switch (boot_mode) {
+        case BootMode::NORMAL_MODE:
+            module_load_file = "modules.load";
+            break;
+        case BootMode::RECOVERY_MODE:
             module_load_file = "modules.load.recovery";
+            break;
+        case BootMode::CHARGER_MODE:
+            module_load_file = "modules.load.charger";
+            break;
+    }
+
+    if (module_load_file != "modules.load") {
+        struct stat fileStat {};
+        std::string load_path = dir_path + "/" + module_load_file;
+        // Fall back to modules.load if the other files aren't accessible
+        if (stat(load_path.c_str(), &fileStat)) {
+            module_load_file = "modules.load";
         }
     }
 
@@ -122,12 +211,13 @@ std::string GetModuleLoadList(bool recovery, const std::string& dir_path) {
 }
 
 #define MODULE_BASE_DIR "/lib/modules"
-bool LoadKernelModules(bool recovery, bool want_console) {
-    struct utsname uts;
+bool LoadKernelModules(BootMode boot_mode, bool want_console, bool want_parallel,
+                       int& modules_loaded) {
+    struct utsname uts {};
     if (uname(&uts)) {
         LOG(FATAL) << "Failed to get kernel version.";
     }
-    int major, minor;
+    int major = 0, minor = 0;
     if (sscanf(uts.release, "%d.%d", &major, &minor) != 2) {
         LOG(FATAL) << "Failed to parse kernel version " << uts.release;
     }
@@ -137,13 +227,30 @@ bool LoadKernelModules(bool recovery, bool want_console) {
         LOG(INFO) << "Unable to open /lib/modules, skipping module loading.";
         return true;
     }
-    dirent* entry;
+    dirent* entry = nullptr;
     std::vector<std::string> module_dirs;
+    const auto page_size_suffix = GetPageSizeSuffix();
+    const std::string release_specific_module_dir = uts.release + page_size_suffix;
     while ((entry = readdir(base_dir.get()))) {
         if (entry->d_type != DT_DIR) {
             continue;
         }
-        int dir_major, dir_minor;
+        if (entry->d_name == release_specific_module_dir) {
+            LOG(INFO) << "Release specific kernel module dir " << release_specific_module_dir
+                      << " found, loading modules from here with no fallbacks.";
+            module_dirs.clear();
+            module_dirs.emplace_back(entry->d_name);
+            break;
+        }
+        // Is a directory does not have page size suffix, it does not mean this directory is for 4K
+        // kernels. Certain 16K kernel builds put all modules in /lib/modules/`uname -r` without any
+        // suffix. Therefore, only ignore a directory if it has _16k/_64k suffix and the suffix does
+        // not match system page size.
+        const auto dir_page_size_suffix = GetPageSizeSuffix(entry->d_name);
+        if (!dir_page_size_suffix.empty() && dir_page_size_suffix != page_size_suffix) {
+            continue;
+        }
+        int dir_major = 0, dir_minor = 0;
         if (sscanf(entry->d_name, "%d.%d", &dir_major, &dir_minor) != 2 || dir_major != major ||
             dir_minor != minor) {
             continue;
@@ -162,21 +269,65 @@ bool LoadKernelModules(bool recovery, bool want_console) {
     for (const auto& module_dir : module_dirs) {
         std::string dir_path = MODULE_BASE_DIR "/";
         dir_path.append(module_dir);
-        Modprobe m({dir_path}, GetModuleLoadList(recovery, dir_path));
+        Modprobe m({dir_path}, GetModuleLoadList(boot_mode, dir_path));
         bool retval = m.LoadListedModules(!want_console);
-        int modules_loaded = m.GetModuleCount();
+        modules_loaded = m.GetModuleCount();
         if (modules_loaded > 0) {
+            LOG(INFO) << "Loaded " << modules_loaded << " modules from " << dir_path;
             return retval;
         }
     }
 
-    Modprobe m({MODULE_BASE_DIR}, GetModuleLoadList(recovery, MODULE_BASE_DIR));
-    bool retval = m.LoadListedModules(!want_console);
-    int modules_loaded = m.GetModuleCount();
+    Modprobe m({MODULE_BASE_DIR}, GetModuleLoadList(boot_mode, MODULE_BASE_DIR));
+    bool retval = (want_parallel) ? m.LoadModulesParallel(std::thread::hardware_concurrency())
+                                  : m.LoadListedModules(!want_console);
+    modules_loaded = m.GetModuleCount();
     if (modules_loaded > 0) {
+        LOG(INFO) << "Loaded " << modules_loaded << " modules from " << MODULE_BASE_DIR;
         return retval;
     }
     return true;
+}
+
+static bool IsChargerMode(const std::string& cmdline, const std::string& bootconfig) {
+    return bootconfig.find("androidboot.mode = \"charger\"") != std::string::npos ||
+            cmdline.find("androidboot.mode=charger") != std::string::npos;
+}
+
+static BootMode GetBootMode(const std::string& cmdline, const std::string& bootconfig)
+{
+    if (IsChargerMode(cmdline, bootconfig))
+        return BootMode::CHARGER_MODE;
+    else if (IsRecoveryMode() && !ForceNormalBoot(cmdline, bootconfig))
+        return BootMode::RECOVERY_MODE;
+
+    return BootMode::NORMAL_MODE;
+}
+
+static void MaybeResumeFromHibernation(const std::string& bootconfig) {
+    std::string hibernationResumeDevice;
+    android::fs_mgr::GetBootconfigFromString(bootconfig, "androidboot.hibernation_resume_device",
+                                             &hibernationResumeDevice);
+    if (!hibernationResumeDevice.empty()) {
+        android::base::unique_fd fd(open("/sys/power/resume", O_RDWR | O_CLOEXEC));
+        if (fd >= 0) {
+            if (!android::base::WriteStringToFd(hibernationResumeDevice, fd)) {
+                PLOG(ERROR) << "Failed to write to /sys/power/resume";
+            }
+        } else {
+            PLOG(ERROR) << "Failed to open /sys/power/resume";
+        }
+    }
+}
+
+static std::unique_ptr<FirstStageMount> CreateFirstStageMount(const std::string& cmdline) {
+    auto ret = FirstStageMount::Create(cmdline);
+    if (ret.ok()) {
+        return std::move(*ret);
+    } else {
+        LOG(ERROR) << "Failed to create FirstStageMount : " << ret.error();
+        return nullptr;
+    }
 }
 
 int FirstStageMain(int argc, char** argv) {
@@ -209,6 +360,10 @@ int FirstStageMain(int argc, char** argv) {
     CHECKCALL(chmod("/proc/cmdline", 0440));
     std::string cmdline;
     android::base::ReadFileToString("/proc/cmdline", &cmdline);
+    // Don't expose the raw bootconfig to unprivileged processes.
+    chmod("/proc/bootconfig", 0440);
+    std::string bootconfig;
+    android::base::ReadFileToString("/proc/bootconfig", &bootconfig);
     gid_t groups[] = {AID_READPROC};
     CHECKCALL(setgroups(arraysize(groups), groups));
     CHECKCALL(mount("sysfs", "/sys", "sysfs", 0, NULL));
@@ -248,7 +403,12 @@ int FirstStageMain(int argc, char** argv) {
     // /second_stage_resources is used to preserve files from first to second
     // stage init
     CHECKCALL(mount("tmpfs", kSecondStageRes, "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV,
-                    "mode=0755,uid=0,gid=0"))
+                    "mode=0755,uid=0,gid=0"));
+
+    if (IsMicrodroid() && android::virtualization::IsOpenDiceChangesFlagEnabled()) {
+        CHECKCALL(mount("tmpfs", "/microdroid_resources", "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV,
+                        "mode=0750,uid=0,gid=0"));
+    }
 #undef CHECKCALL
 
     SetStdioToDevNull(argv);
@@ -270,23 +430,50 @@ int FirstStageMain(int argc, char** argv) {
         PLOG(ERROR) << "Could not opendir(\"/\"), not freeing ramdisk";
     }
 
-    struct stat old_root_info;
+    struct stat old_root_info {};
     if (stat("/", &old_root_info) != 0) {
         PLOG(ERROR) << "Could not stat(\"/\"), not freeing ramdisk";
         old_root_dir.reset();
     }
 
-    auto want_console = ALLOW_FIRST_STAGE_CONSOLE ? FirstStageConsole(cmdline) : 0;
+    auto want_console = ALLOW_FIRST_STAGE_CONSOLE ? FirstStageConsole(cmdline, bootconfig) : 0;
+    auto want_parallel =
+            bootconfig.find("androidboot.load_modules_parallel = \"true\"") != std::string::npos;
 
-    if (!LoadKernelModules(IsRecoveryMode() && !ForceNormalBoot(cmdline), want_console)) {
+    boot_clock::time_point module_start_time = boot_clock::now();
+    int module_count = 0;
+    BootMode boot_mode = GetBootMode(cmdline, bootconfig);
+    if (!LoadKernelModules(boot_mode, want_console,
+                           want_parallel, module_count)) {
         if (want_console != FirstStageConsoleParam::DISABLED) {
             LOG(ERROR) << "Failed to load kernel modules, starting console";
         } else {
             LOG(FATAL) << "Failed to load kernel modules";
         }
     }
+    if (module_count > 0) {
+        auto module_elapse_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                boot_clock::now() - module_start_time);
+        setenv(kEnvInitModuleDurationMs, std::to_string(module_elapse_time.count()).c_str(), 1);
+        LOG(INFO) << "Loaded " << module_count << " kernel modules took "
+                  << module_elapse_time.count() << " ms";
+    }
 
+    MaybeResumeFromHibernation(bootconfig);
+
+    std::unique_ptr<FirstStageMount> fsm;
+
+    bool created_devices = false;
     if (want_console == FirstStageConsoleParam::CONSOLE_ON_FAILURE) {
+        if (!IsRecoveryMode()) {
+            fsm = CreateFirstStageMount(cmdline);
+            if (fsm) {
+                created_devices = fsm->DoCreateDevices();
+                if (!created_devices) {
+                    LOG(ERROR) << "Failed to create device nodes early";
+                }
+            }
+        }
         StartConsole(cmdline);
     }
 
@@ -304,34 +491,57 @@ int FirstStageMain(int argc, char** argv) {
         LOG(INFO) << "Copied ramdisk prop to " << dest;
     }
 
-    if (ForceNormalBoot(cmdline)) {
+    // If "/force_debuggable" is present, the second-stage init will use a userdebug
+    // sepolicy and load adb_debug.prop to allow adb root, if the device is unlocked.
+    if (access("/force_debuggable", F_OK) == 0) {
+        constexpr const char adb_debug_prop_src[] = "/adb_debug.prop";
+        constexpr const char userdebug_plat_sepolicy_cil_src[] = "/userdebug_plat_sepolicy.cil";
+        std::error_code ec;  // to invoke the overloaded copy_file() that won't throw.
+        if (access(adb_debug_prop_src, F_OK) == 0 &&
+            !fs::copy_file(adb_debug_prop_src, kDebugRamdiskProp, ec)) {
+            LOG(WARNING) << "Can't copy " << adb_debug_prop_src << " to " << kDebugRamdiskProp
+                         << ": " << ec.message();
+        }
+        if (access(userdebug_plat_sepolicy_cil_src, F_OK) == 0 &&
+            !fs::copy_file(userdebug_plat_sepolicy_cil_src, kDebugRamdiskSEPolicy, ec)) {
+            LOG(WARNING) << "Can't copy " << userdebug_plat_sepolicy_cil_src << " to "
+                         << kDebugRamdiskSEPolicy << ": " << ec.message();
+        }
+        // setenv for second-stage init to read above kDebugRamdisk* files.
+        setenv("INIT_FORCE_DEBUGGABLE", "true", 1);
+    }
+
+    if (ForceNormalBoot(cmdline, bootconfig)) {
         mkdir("/first_stage_ramdisk", 0755);
+        PrepareSwitchRoot();
         // SwitchRoot() must be called with a mount point as the target, so we bind mount the
         // target directory to itself here.
         if (mount("/first_stage_ramdisk", "/first_stage_ramdisk", nullptr, MS_BIND, nullptr) != 0) {
-            LOG(FATAL) << "Could not bind mount /first_stage_ramdisk to itself";
+            PLOG(FATAL) << "Could not bind mount /first_stage_ramdisk to itself";
         }
         SwitchRoot("/first_stage_ramdisk");
     }
 
-    // If this file is present, the second-stage init will use a userdebug sepolicy
-    // and load adb_debug.prop to allow adb root, if the device is unlocked.
-    if (access("/force_debuggable", F_OK) == 0) {
-        std::error_code ec;  // to invoke the overloaded copy_file() that won't throw.
-        if (!fs::copy_file("/adb_debug.prop", kDebugRamdiskProp, ec) ||
-            !fs::copy_file("/userdebug_plat_sepolicy.cil", kDebugRamdiskSEPolicy, ec)) {
-            LOG(ERROR) << "Failed to setup debug ramdisk";
-        } else {
-            // setenv for second-stage init to read above kDebugRamdisk* files.
-            setenv("INIT_FORCE_DEBUGGABLE", "true", 1);
+    if (IsRecoveryMode()) {
+        LOG(INFO) << "First stage mount skipped (recovery mode)";
+    } else {
+        if (!fsm) {
+            fsm = CreateFirstStageMount(cmdline);
+        }
+        if (!fsm) {
+            LOG(FATAL) << "FirstStageMount not available";
+        }
+
+        if (!created_devices && !fsm->DoCreateDevices()) {
+            LOG(FATAL) << "Failed to create devices required for first stage mount";
+        }
+
+        if (!fsm->DoFirstStageMount()) {
+            LOG(FATAL) << "Failed to mount required partitions early ...";
         }
     }
 
-    if (!DoFirstStageMount()) {
-        LOG(FATAL) << "Failed to mount required partitions early ...";
-    }
-
-    struct stat new_root_info;
+    struct stat new_root_info {};
     if (stat("/", &new_root_info) != 0) {
         PLOG(ERROR) << "Could not stat(\"/\"), not freeing ramdisk";
         old_root_dir.reset();

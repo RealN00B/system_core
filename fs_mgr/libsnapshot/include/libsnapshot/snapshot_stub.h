@@ -28,18 +28,21 @@ class SnapshotManagerStub : public ISnapshotManager {
     bool BeginUpdate() override;
     bool CancelUpdate() override;
     bool FinishedSnapshotWrites(bool wipe) override;
-    bool InitiateMerge(uint64_t* cow_file_size = nullptr) override;
+    void UpdateCowStats(ISnapshotMergeStats* stats) override;
+    MergeFailureCode ReadMergeFailureCode() override;
+    bool InitiateMerge() override;
     UpdateState ProcessUpdateState(const std::function<bool()>& callback = {},
                                    const std::function<bool()>& before_cancel = {}) override;
     UpdateState GetUpdateState(double* progress = nullptr) override;
     bool UpdateUsesCompression() override;
+    bool UpdateUsesUserSnapshots() override;
     Return CreateUpdateSnapshots(
             const chromeos_update_engine::DeltaArchiveManifest& manifest) override;
     bool MapUpdateSnapshot(const android::fs_mgr::CreateLogicalPartitionParams& params,
                            std::string* snapshot_path) override;
-    std::unique_ptr<ISnapshotWriter> OpenSnapshotWriter(
+    std::unique_ptr<ICowWriter> OpenSnapshotWriter(
             const android::fs_mgr::CreateLogicalPartitionParams& params,
-            const std::optional<std::string>& source_device) override;
+            std::optional<uint64_t> label) override;
     bool UnmapUpdateSnapshot(const std::string& target_partition_name) override;
     bool NeedSnapshotsInFirstStageMount() override;
     bool CreateLogicalAndSnapshotPartitions(
@@ -55,6 +58,8 @@ class SnapshotManagerStub : public ISnapshotManager {
     ISnapshotMergeStats* GetSnapshotMergeStatsInstance() override;
     bool MapAllSnapshots(const std::chrono::milliseconds& timeout_ms) override;
     bool UnmapAllSnapshots() override;
+    std::string ReadSourceBuildFingerprint() override;
+    void SetMergeStatsFeatures(ISnapshotMergeStats* stats) override;
 };
 
 }  // namespace android::snapshot

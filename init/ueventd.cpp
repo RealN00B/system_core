@@ -115,11 +115,13 @@ class ColdBoot {
   public:
     ColdBoot(UeventListener& uevent_listener,
              std::vector<std::unique_ptr<UeventHandler>>& uevent_handlers,
-             bool enable_parallel_restorecon)
+             bool enable_parallel_restorecon,
+             std::vector<std::string> parallel_restorecon_queue)
         : uevent_listener_(uevent_listener),
           uevent_handlers_(uevent_handlers),
           num_handler_subprocesses_(std::thread::hardware_concurrency() ?: 4),
-          enable_parallel_restorecon_(enable_parallel_restorecon) {}
+          enable_parallel_restorecon_(enable_parallel_restorecon),
+          parallel_restorecon_queue_(parallel_restorecon_queue) {}
 
     void Run();
 
@@ -142,6 +144,8 @@ class ColdBoot {
     std::set<pid_t> subprocess_pids_;
 
     std::vector<std::string> restorecon_queue_;
+
+    std::vector<std::string> parallel_restorecon_queue_;
 };
 
 void ColdBoot::UeventHandlerMain(unsigned int process_num, unsigned int total_processes) {
@@ -155,17 +159,34 @@ void ColdBoot::UeventHandlerMain(unsigned int process_num, unsigned int total_pr
 }
 
 void ColdBoot::RestoreConHandler(unsigned int process_num, unsigned int total_processes) {
+    android::base::Timer t_process;
+
     for (unsigned int i = process_num; i < restorecon_queue_.size(); i += total_processes) {
+        android::base::Timer t;
         auto& dir = restorecon_queue_[i];
 
         selinux_android_restorecon(dir.c_str(), SELINUX_ANDROID_RESTORECON_RECURSE);
+
+        //Mark a dir restorecon operation for 50ms,
+        //Maybe you can add this dir to the ueventd.rc script to parallel processing
+        if (t.duration() > 50ms) {
+            LOG(INFO) << "took " << t.duration().count() <<"ms restorecon '"
+                        << dir.c_str() << "' on process '" << process_num  <<"'";
+        }
     }
+
+    //Calculate process restorecon time
+    LOG(VERBOSE) << "took " << t_process.duration().count() << "ms on process '"
+                << process_num  << "'";
 }
 
 void ColdBoot::GenerateRestoreCon(const std::string& directory) {
     std::unique_ptr<DIR, decltype(&closedir)> dir(opendir(directory.c_str()), &closedir);
 
-    if (!dir) return;
+    if (!dir) {
+        PLOG(WARNING) << "opendir " << directory.c_str();
+        return;
+    }
 
     struct dirent* dent;
     while ((dent = readdir(dir.get())) != NULL) {
@@ -176,7 +197,10 @@ void ColdBoot::GenerateRestoreCon(const std::string& directory) {
 
         if (S_ISDIR(st.st_mode)) {
             std::string fullpath = directory + "/" + dent->d_name;
-            if (fullpath != "/sys/devices") {
+            auto parallel_restorecon =
+                std::find(parallel_restorecon_queue_.begin(),
+                    parallel_restorecon_queue_.end(), fullpath);
+            if (parallel_restorecon == parallel_restorecon_queue_.end()) {
                 restorecon_queue_.emplace_back(fullpath);
             }
         }
@@ -248,11 +272,16 @@ void ColdBoot::Run() {
     RegenerateUevents();
 
     if (enable_parallel_restorecon_) {
-        selinux_android_restorecon("/sys", 0);
-        selinux_android_restorecon("/sys/devices", 0);
-        GenerateRestoreCon("/sys");
-        // takes long time for /sys/devices, parallelize it
-        GenerateRestoreCon("/sys/devices");
+        if (parallel_restorecon_queue_.empty()) {
+            parallel_restorecon_queue_.emplace_back("/sys");
+            // takes long time for /sys/devices, parallelize it
+            parallel_restorecon_queue_.emplace_back("/sys/devices");
+            LOG(INFO) << "Parallel processing directory is not set, set the default";
+        }
+        for (const auto& dir : parallel_restorecon_queue_) {
+            selinux_android_restorecon(dir.c_str(), 0);
+            GenerateRestoreCon(dir);
+        }
     }
 
     ForkSubProcesses();
@@ -268,14 +297,41 @@ void ColdBoot::Run() {
 }
 
 static UeventdConfiguration GetConfiguration() {
-    // TODO: Remove these legacy paths once Android S is no longer supported.
-    if (android::base::GetIntProperty("ro.product.first_api_level", 10000) <= __ANDROID_API_S__) {
-        auto hardware = android::base::GetProperty("ro.hardware", "");
-        return ParseConfig({"/system/etc/ueventd.rc", "/vendor/ueventd.rc", "/odm/ueventd.rc",
-                            "/ueventd." + hardware + ".rc"});
+    if (IsMicrodroid()) {
+        return ParseConfig({"/system/etc/ueventd.rc", "/vendor/etc/ueventd.rc"});
     }
 
-    return ParseConfig({"/system/etc/ueventd.rc"});
+    auto hardware = android::base::GetProperty("ro.hardware", "");
+
+    struct LegacyPathInfo {
+        std::string legacy_path;
+        std::string preferred;
+    };
+    std::vector<LegacyPathInfo> legacy_paths{
+            {"/vendor/ueventd.rc", "/vendor/etc/ueventd.rc"},
+            {"/odm/ueventd.rc", "/odm/etc/ueventd.rc"},
+            {"/ueventd." + hardware + ".rc", "another ueventd.rc file"}};
+
+    std::vector<std::string> canonical{"/system/etc/ueventd.rc"};
+
+    if (android::base::GetIntProperty("ro.product.first_api_level", 10000) < __ANDROID_API_T__) {
+        // TODO: Remove these legacy paths once Android S is no longer supported.
+        for (const auto& info : legacy_paths) {
+            canonical.push_back(info.legacy_path);
+        }
+    } else {
+        // Warn if newer device is using legacy paths.
+        for (const auto& info : legacy_paths) {
+            if (access(info.legacy_path.c_str(), F_OK) == 0) {
+                LOG(FATAL_WITHOUT_ABORT)
+                        << "Legacy ueventd configuration file detected and will not be parsed: "
+                        << info.legacy_path << ". Please move your configuration to "
+                        << info.preferred << " instead.";
+            }
+        }
+    }
+
+    return ParseConfig(canonical);
 }
 
 int ueventd_main(int argc, char** argv) {
@@ -297,10 +353,25 @@ int ueventd_main(int argc, char** argv) {
 
     auto ueventd_configuration = GetConfiguration();
 
-    uevent_handlers.emplace_back(std::make_unique<DeviceHandler>(
+    UeventListener uevent_listener(ueventd_configuration.uevent_socket_rcvbuf_size);
+
+    // Right after making DeviceHandler, replay all events looking for which
+    // block device has the boot partition. This lets us make symlinks
+    // for all of the other partitions on the same disk. Note that by the time
+    // we get here we know that the boot partition has already shown up (if
+    // we're looking for it) so just regenerating events is enough to know
+    // we'll see it.
+    std::unique_ptr<DeviceHandler> device_handler = std::make_unique<DeviceHandler>(
             std::move(ueventd_configuration.dev_permissions),
             std::move(ueventd_configuration.sysfs_permissions),
-            std::move(ueventd_configuration.subsystems), android::fs_mgr::GetBootDevices(), true));
+            std::move(ueventd_configuration.drivers), std::move(ueventd_configuration.subsystems),
+            android::fs_mgr::GetBootDevices(), android::fs_mgr::GetBootPartUuid(), true);
+    uevent_listener.RegenerateUevents([&](const Uevent& uevent) -> ListenerAction {
+        bool uuid_check_done = device_handler->CheckUeventForBootPartUuid(uevent);
+        return uuid_check_done ? ListenerAction::kStop : ListenerAction::kContinue;
+    });
+
+    uevent_handlers.emplace_back(std::move(device_handler));
     uevent_handlers.emplace_back(std::make_unique<FirmwareHandler>(
             std::move(ueventd_configuration.firmware_directories),
             std::move(ueventd_configuration.external_firmware_handlers)));
@@ -309,11 +380,10 @@ int ueventd_main(int argc, char** argv) {
         std::vector<std::string> base_paths = {"/odm/lib/modules", "/vendor/lib/modules"};
         uevent_handlers.emplace_back(std::make_unique<ModaliasHandler>(base_paths));
     }
-    UeventListener uevent_listener(ueventd_configuration.uevent_socket_rcvbuf_size);
-
     if (!android::base::GetBoolProperty(kColdBootDoneProp, false)) {
         ColdBoot cold_boot(uevent_listener, uevent_handlers,
-                           ueventd_configuration.enable_parallel_restorecon);
+                           ueventd_configuration.enable_parallel_restorecon,
+                           ueventd_configuration.parallel_restorecon_dirs);
         cold_boot.Run();
     }
 

@@ -13,19 +13,23 @@
 // limitations under the License.
 
 #include "device_info.h"
+#include "scratch_super.h"
 
 #include <android-base/logging.h>
 #include <fs_mgr.h>
 #include <fs_mgr_overlayfs.h>
+#include <libfiemap/image_manager.h>
 
 namespace android {
 namespace snapshot {
 
 #ifdef LIBSNAPSHOT_USE_HAL
-using android::hardware::boot::V1_0::BoolResult;
-using android::hardware::boot::V1_0::CommandResult;
+using android::hal::BootControlClient;
+using android::hal::BootControlVersion;
+using android::hal::CommandResult;
 #endif
 
+using namespace std::chrono_literals;
 using namespace std::string_literals;
 
 #ifdef __ANDROID_RECOVERY__
@@ -34,12 +38,24 @@ constexpr bool kIsRecovery = true;
 constexpr bool kIsRecovery = false;
 #endif
 
-std::string DeviceInfo::GetGsidDir() const {
-    return "ota"s;
+DeviceInfo::DeviceInfo() {
+    std::string scratch_device = android::snapshot::GetScratchOtaMetadataPartition();
+    if (!scratch_device.empty()) {
+        std::string scratch_metadata =
+                android::snapshot::MapScratchOtaMetadataPartition(scratch_device);
+        if (!scratch_metadata.empty()) {
+            SetMetadataDir(scratch_metadata);
+            SetTempMetadata();
+        }
+    }
 }
 
 std::string DeviceInfo::GetMetadataDir() const {
-    return "/metadata/ota"s;
+    return metadata_dir_;
+}
+
+void DeviceInfo::SetMetadataDir(const std::string& value) {
+    metadata_dir_ = value;
 }
 
 std::string DeviceInfo::GetSlotSuffix() const {
@@ -65,16 +81,16 @@ bool DeviceInfo::IsOverlayfsSetup() const {
 #ifdef LIBSNAPSHOT_USE_HAL
 bool DeviceInfo::EnsureBootHal() {
     if (!boot_control_) {
-        auto hal = android::hardware::boot::V1_0::IBootControl::getService();
+        auto hal = BootControlClient::WaitForService();
         if (!hal) {
             LOG(ERROR) << "Could not find IBootControl HAL";
             return false;
         }
-        boot_control_ = android::hardware::boot::V1_1::IBootControl::castFrom(hal);
-        if (!boot_control_) {
+        if (hal->GetVersion() < BootControlVersion::BOOTCTL_V1_1) {
             LOG(ERROR) << "Could not find IBootControl 1.1 HAL";
             return false;
         }
+        boot_control_ = std::move(hal);
     }
     return true;
 }
@@ -85,8 +101,9 @@ bool DeviceInfo::SetBootControlMergeStatus([[maybe_unused]] MergeStatus status) 
     if (!EnsureBootHal()) {
         return false;
     }
-    if (!boot_control_->setSnapshotMergeStatus(status)) {
-        LOG(ERROR) << "Unable to set the snapshot merge status";
+    const auto ret = boot_control_->SetSnapshotMergeStatus(status);
+    if (!ret.IsOk()) {
+        LOG(ERROR) << "Unable to set the snapshot merge status " << ret.errMsg;
         return false;
     }
     return true;
@@ -100,15 +117,35 @@ bool DeviceInfo::IsRecovery() const {
     return kIsRecovery;
 }
 
+bool DeviceInfo::IsFirstStageInit() const {
+    return first_stage_init_;
+}
+
+bool DeviceInfo::SetActiveBootSlot([[maybe_unused]] unsigned int slot) {
+#ifdef LIBSNAPSHOT_USE_HAL
+    if (!EnsureBootHal()) {
+        return false;
+    }
+
+    CommandResult result = boot_control_->SetActiveBootSlot(slot);
+    if (!result.success) {
+        LOG(ERROR) << "Error setting slot " << slot << " active: " << result.errMsg;
+        return false;
+    }
+    return true;
+#else
+    LOG(ERROR) << "HAL support not enabled.";
+    return false;
+#endif
+}
+
 bool DeviceInfo::SetSlotAsUnbootable([[maybe_unused]] unsigned int slot) {
 #ifdef LIBSNAPSHOT_USE_HAL
     if (!EnsureBootHal()) {
         return false;
     }
 
-    CommandResult result = {};
-    auto cb = [&](CommandResult r) -> void { result = r; };
-    boot_control_->setSlotAsUnbootable(slot, cb);
+    CommandResult result = boot_control_->MarkSlotUnbootable(slot);
     if (!result.success) {
         LOG(ERROR) << "Error setting slot " << slot << " unbootable: " << result.errMsg;
         return false;
@@ -118,6 +155,27 @@ bool DeviceInfo::SetSlotAsUnbootable([[maybe_unused]] unsigned int slot) {
     LOG(ERROR) << "HAL support not enabled.";
     return false;
 #endif
+}
+
+std::unique_ptr<android::fiemap::IImageManager> DeviceInfo::OpenImageManager() const {
+    return IDeviceInfo::OpenImageManager("ota");
+}
+
+std::unique_ptr<android::fiemap::IImageManager> ISnapshotManager::IDeviceInfo::OpenImageManager(
+        const std::string& gsid_dir) const {
+    if (IsRecovery() || IsFirstStageInit()) {
+        android::fiemap::ImageManager::DeviceInfo device_info = {
+                .is_recovery = {IsRecovery()},
+        };
+        return android::fiemap::ImageManager::Open(gsid_dir, device_info);
+    } else {
+        // For now, use a preset timeout.
+        return android::fiemap::IImageManager::Open(gsid_dir, 15000ms);
+    }
+}
+
+android::dm::IDeviceMapper& DeviceInfo::GetDeviceMapper() {
+    return android::dm::DeviceMapper::Instance();
 }
 
 }  // namespace snapshot

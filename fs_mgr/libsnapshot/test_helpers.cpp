@@ -18,10 +18,12 @@
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/parsebool.h>
 #include <android-base/properties.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <gtest/gtest.h>
+#include <liblp/property_fetcher.h>
 #include <openssl/sha.h>
 #include <payload_consumer/file_descriptor.h>
 
@@ -128,54 +130,7 @@ bool WriteRandomData(const std::string& path, std::optional<size_t> expect_size,
     return true;
 }
 
-bool WriteRandomData(ICowWriter* writer, std::string* hash) {
-    unique_fd rand(open("/dev/urandom", O_RDONLY));
-    if (rand < 0) {
-        PLOG(ERROR) << "open /dev/urandom";
-        return false;
-    }
-
-    SHA256_CTX ctx;
-    if (hash) {
-        SHA256_Init(&ctx);
-    }
-
-    if (!writer->options().max_blocks) {
-        LOG(ERROR) << "CowWriter must specify maximum number of blocks";
-        return false;
-    }
-    uint64_t num_blocks = writer->options().max_blocks.value();
-
-    size_t block_size = writer->options().block_size;
-    std::string block(block_size, '\0');
-    for (uint64_t i = 0; i < num_blocks; i++) {
-        if (!ReadFully(rand, block.data(), block.size())) {
-            PLOG(ERROR) << "read /dev/urandom";
-            return false;
-        }
-        if (!writer->AddRawBlocks(i, block.data(), block.size())) {
-            LOG(ERROR) << "Failed to add raw block " << i;
-            return false;
-        }
-        if (hash) {
-            SHA256_Update(&ctx, block.data(), block.size());
-        }
-    }
-
-    if (hash) {
-        uint8_t out[32];
-        SHA256_Final(out, &ctx);
-        *hash = ToHexString(out, sizeof(out));
-    }
-    return true;
-}
-
-std::string HashSnapshot(ISnapshotWriter* writer) {
-    auto reader = writer->OpenReader();
-    if (!reader) {
-        return {};
-    }
-
+std::string HashSnapshot(ICowWriter::FileDescriptor* reader) {
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
 
@@ -254,70 +209,41 @@ uint64_t GetSize(PartitionUpdate* partition_update) {
     return partition_update->mutable_new_partition_info()->size();
 }
 
-AssertionResult LowSpaceUserdata::Init(uint64_t max_free_space) {
-    auto res = ReadUserdataStats();
-    if (!res) return res;
-
-    // Try to fill up the disk as much as possible until free_space_ <= max_free_space.
-    big_file_ = std::make_unique<TemporaryFile>();
-    if (big_file_->fd == -1) {
-        return AssertionFailure() << strerror(errno);
-    }
-    if (!android::base::StartsWith(big_file_->path, kUserDataDevice)) {
-        return AssertionFailure() << "Temp file allocated to " << big_file_->path << ", not in "
-                                  << kUserDataDevice;
-    }
-    uint64_t next_consume =
-            std::min(free_space_ - max_free_space, (uint64_t)std::numeric_limits<off_t>::max());
-    off_t allocated = 0;
-    while (next_consume > 0 && free_space_ > max_free_space) {
-        int status = fallocate(big_file_->fd, 0, allocated, next_consume);
-        if (status == -1 && errno == ENOSPC) {
-            next_consume /= 2;
-            continue;
-        }
-        if (status == -1) {
-            return AssertionFailure() << strerror(errno);
-        }
-        allocated += next_consume;
-
-        res = ReadUserdataStats();
-        if (!res) return res;
-    }
-
-    LOG(INFO) << allocated << " bytes allocated to " << big_file_->path;
-    initialized_ = true;
-    return AssertionSuccess();
-}
-
-AssertionResult LowSpaceUserdata::ReadUserdataStats() {
-    struct statvfs buf;
-    if (statvfs(kUserDataDevice, &buf) == -1) {
-        return AssertionFailure() << strerror(errno);
-    }
-    bsize_ = buf.f_bsize;
-    free_space_ = bsize_ * buf.f_bfree;
-    available_space_ = bsize_ * buf.f_bavail;
-    return AssertionSuccess();
-}
-
-uint64_t LowSpaceUserdata::free_space() const {
-    CHECK(initialized_);
-    return free_space_;
-}
-
-uint64_t LowSpaceUserdata::available_space() const {
-    CHECK(initialized_);
-    return available_space_;
-}
-
-uint64_t LowSpaceUserdata::bsize() const {
-    CHECK(initialized_);
-    return bsize_;
-}
-
 bool IsVirtualAbEnabled() {
     return android::base::GetBoolProperty("ro.virtual_ab.enabled", false);
+}
+
+SnapshotTestPropertyFetcher::SnapshotTestPropertyFetcher(
+        const std::string& slot_suffix, std::unordered_map<std::string, std::string>&& props)
+    : properties_(std::move(props)) {
+    properties_["ro.boot.slot_suffix"] = slot_suffix;
+    properties_["ro.boot.dynamic_partitions"] = "true";
+    properties_["ro.boot.dynamic_partitions_retrofit"] = "false";
+    properties_["ro.virtual_ab.enabled"] = "true";
+}
+
+std::string SnapshotTestPropertyFetcher::GetProperty(const std::string& key,
+                                                     const std::string& defaultValue) {
+    auto iter = properties_.find(key);
+    if (iter == properties_.end()) {
+        return android::base::GetProperty(key, defaultValue);
+    }
+    return iter->second;
+}
+
+bool SnapshotTestPropertyFetcher::GetBoolProperty(const std::string& key, bool defaultValue) {
+    auto iter = properties_.find(key);
+    if (iter == properties_.end()) {
+        return android::base::GetBoolProperty(key, defaultValue);
+    }
+    switch (android::base::ParseBool(iter->second)) {
+        case android::base::ParseBoolResult::kTrue:
+            return true;
+        case android::base::ParseBoolResult::kFalse:
+            return false;
+        default:
+            return defaultValue;
+    }
 }
 
 }  // namespace snapshot

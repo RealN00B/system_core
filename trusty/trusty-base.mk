@@ -22,11 +22,23 @@
 # For gatekeeper, we include the generic -service and -impl to use legacy
 # HAL loading of gatekeeper.trusty.
 
+$(call inherit-product, system/core/trusty/keymint/trusty-keymint.mk)
+
+ifeq ($(SECRETKEEPER_ENABLED),true)
+    LOCAL_SECRETKEEPER_PRODUCT_PACKAGE := android.hardware.security.secretkeeper.trusty
+else
+    LOCAL_SECRETKEEPER_PRODUCT_PACKAGE :=
+endif
+
 PRODUCT_PACKAGES += \
-	android.hardware.keymaster@4.0-service.trusty \
-	android.hardware.gatekeeper@1.0-service.trusty \
-	trusty_apploader
+	$(LOCAL_SECRETKEEPER_PRODUCT_PACKAGE) \
+	android.hardware.gatekeeper-service.trusty \
+	trusty_apploader \
 
 PRODUCT_PROPERTY_OVERRIDES += \
+	ro.hardware.keystore_desede=true \
 	ro.hardware.keystore=trusty \
 	ro.hardware.gatekeeper=trusty
+
+PRODUCT_COPY_FILES += \
+	frameworks/native/data/etc/android.hardware.keystore.app_attest_key.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.keystore.app_attest_key.xml

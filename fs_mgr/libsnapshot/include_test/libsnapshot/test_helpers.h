@@ -17,10 +17,10 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <android-base/file.h>
-#include <android/hardware/boot/1.1/IBootControl.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <libfiemap/image_manager.h>
@@ -30,13 +30,15 @@
 #include <storage_literals/storage_literals.h>
 #include <update_engine/update_metadata.pb.h>
 
+#include "utility.h"
+
 namespace android {
 namespace snapshot {
 
+using aidl::android::hardware::boot::MergeStatus;
 using android::fs_mgr::IPropertyFetcher;
 using android::fs_mgr::MetadataBuilder;
 using android::fs_mgr::testing::MockPropertyFetcher;
-using android::hardware::boot::V1_1::MergeStatus;
 using chromeos_update_engine::DeltaArchiveManifest;
 using chromeos_update_engine::PartitionUpdate;
 using testing::_;
@@ -77,8 +79,7 @@ class TestDeviceInfo : public SnapshotManager::IDeviceInfo {
         : TestDeviceInfo(fake_super) {
         set_slot_suffix(slot_suffix);
     }
-    std::string GetGsidDir() const override { return "ota/test"s; }
-    std::string GetMetadataDir() const override { return "/metadata/ota/test"s; }
+    std::string GetMetadataDir() const override { return metadata_dir_; }
     std::string GetSlotSuffix() const override { return slot_suffix_; }
     std::string GetOtherSlotSuffix() const override { return slot_suffix_ == "_a" ? "_b" : "_a"; }
     std::string GetSuperDevice([[maybe_unused]] uint32_t slot) const override { return "super"; }
@@ -91,11 +92,22 @@ class TestDeviceInfo : public SnapshotManager::IDeviceInfo {
     }
     bool IsOverlayfsSetup() const override { return false; }
     bool IsRecovery() const override { return recovery_; }
+    bool SetActiveBootSlot([[maybe_unused]] unsigned int slot) override { return true; }
     bool SetSlotAsUnbootable(unsigned int slot) override {
         unbootable_slots_.insert(slot);
         return true;
     }
     bool IsTestDevice() const override { return true; }
+    bool IsFirstStageInit() const override { return first_stage_init_; }
+    std::unique_ptr<IImageManager> OpenImageManager() const override {
+        return IDeviceInfo::OpenImageManager("ota/test");
+    }
+    android::dm::IDeviceMapper& GetDeviceMapper() override {
+        if (dm_) {
+            return *dm_;
+        }
+        return android::dm::DeviceMapper::Instance();
+    }
 
     bool IsSlotUnbootable(uint32_t slot) { return unbootable_slots_.count(slot) != 0; }
 
@@ -104,37 +116,87 @@ class TestDeviceInfo : public SnapshotManager::IDeviceInfo {
         opener_ = std::make_unique<TestPartitionOpener>(path);
     }
     void set_recovery(bool value) { recovery_ = value; }
+    void set_first_stage_init(bool value) { first_stage_init_ = value; }
+    void set_dm(android::dm::IDeviceMapper* dm) { dm_ = dm; }
+
     MergeStatus merge_status() const { return merge_status_; }
+    bool IsTempMetadata() const override { return temp_metadata_; }
 
   private:
     std::string slot_suffix_ = "_a";
     std::unique_ptr<TestPartitionOpener> opener_;
     MergeStatus merge_status_;
     bool recovery_ = false;
+    bool first_stage_init_ = false;
     std::unordered_set<uint32_t> unbootable_slots_;
+    android::dm::IDeviceMapper* dm_ = nullptr;
+    std::string metadata_dir_ = "/metadata/ota/test";
+    bool temp_metadata_ = false;
 };
 
-class SnapshotTestPropertyFetcher : public android::fs_mgr::testing::MockPropertyFetcher {
+class DeviceMapperWrapper : public android::dm::IDeviceMapper {
+    using DmDeviceState = android::dm::DmDeviceState;
+    using DmTable = android::dm::DmTable;
+
   public:
-    SnapshotTestPropertyFetcher(const std::string& slot_suffix) {
-        using testing::Return;
-        ON_CALL(*this, GetProperty("ro.boot.slot_suffix", _)).WillByDefault(Return(slot_suffix));
-        ON_CALL(*this, GetBoolProperty("ro.boot.dynamic_partitions", _))
-                .WillByDefault(Return(true));
-        ON_CALL(*this, GetBoolProperty("ro.boot.dynamic_partitions_retrofit", _))
-                .WillByDefault(Return(false));
-        ON_CALL(*this, GetBoolProperty("ro.virtual_ab.enabled", _)).WillByDefault(Return(true));
+    DeviceMapperWrapper() : impl_(android::dm::DeviceMapper::Instance()) {}
+    explicit DeviceMapperWrapper(android::dm::IDeviceMapper& impl) : impl_(impl) {}
+
+    virtual bool CreateDevice(const std::string& name, const DmTable& table, std::string* path,
+                              const std::chrono::milliseconds& timeout_ms) override {
+        return impl_.CreateDevice(name, table, path, timeout_ms);
+    }
+    virtual DmDeviceState GetState(const std::string& name) const override {
+        return impl_.GetState(name);
+    }
+    virtual bool LoadTable(const std::string& name, const DmTable& table) {
+        return impl_.LoadTable(name, table);
+    }
+    virtual bool LoadTableAndActivate(const std::string& name, const DmTable& table) {
+        return impl_.LoadTableAndActivate(name, table);
+    }
+    virtual bool GetTableInfo(const std::string& name, std::vector<TargetInfo>* table) {
+        return impl_.GetTableInfo(name, table);
+    }
+    virtual bool GetTableStatus(const std::string& name, std::vector<TargetInfo>* table) {
+        return impl_.GetTableStatus(name, table);
+    }
+    virtual bool GetTableStatusIma(const std::string& name, std::vector<TargetInfo>* table) {
+        return impl_.GetTableStatusIma(name, table);
+    }
+    virtual bool GetDmDevicePathByName(const std::string& name, std::string* path) {
+        return impl_.GetDmDevicePathByName(name, path);
+    }
+    virtual bool GetDeviceString(const std::string& name, std::string* dev) {
+        return impl_.GetDeviceString(name, dev);
+    }
+    virtual bool DeleteDeviceIfExists(const std::string& name) {
+        return impl_.DeleteDeviceIfExists(name);
     }
 
-    static void SetUp(const std::string& slot_suffix = "_a") { Reset(slot_suffix); }
+  private:
+    android::dm::IDeviceMapper& impl_;
+};
 
+class SnapshotTestPropertyFetcher : public android::fs_mgr::IPropertyFetcher {
+  public:
+    explicit SnapshotTestPropertyFetcher(const std::string& slot_suffix,
+                                         std::unordered_map<std::string, std::string>&& props = {});
+
+    std::string GetProperty(const std::string& key, const std::string& defaultValue) override;
+    bool GetBoolProperty(const std::string& key, bool defaultValue) override;
+
+    static void SetUp(const std::string& slot_suffix = "_a") { Reset(slot_suffix); }
     static void TearDown() { Reset("_a"); }
 
   private:
     static void Reset(const std::string& slot_suffix) {
         IPropertyFetcher::OverrideForTesting(
-                std::make_unique<NiceMock<SnapshotTestPropertyFetcher>>(slot_suffix));
+                std::make_unique<SnapshotTestPropertyFetcher>(slot_suffix));
     }
+
+  private:
+    std::unordered_map<std::string, std::string> properties_;
 };
 
 // Helper for error-spam-free cleanup.
@@ -145,8 +207,9 @@ void DeleteBackingImage(android::fiemap::IImageManager* manager, const std::stri
 // Expect space of |path| is multiple of 4K.
 bool WriteRandomData(const std::string& path, std::optional<size_t> expect_size = std::nullopt,
                      std::string* hash = nullptr);
-bool WriteRandomData(ICowWriter* writer, std::string* hash = nullptr);
-std::string HashSnapshot(ISnapshotWriter* writer);
+std::string HashSnapshot(ICowWriter::FileDescriptor* writer);
+
+std::string ToHexString(const uint8_t* buf, size_t len);
 
 std::optional<std::string> GetHash(const std::string& path);
 
@@ -159,29 +222,6 @@ void SetSize(PartitionUpdate* partition_update, uint64_t size);
 
 // Get partition size from update package metadata.
 uint64_t GetSize(PartitionUpdate* partition_update);
-
-// Util class for test cases on low space scenario. These tests assumes image manager
-// uses /data as backup device.
-class LowSpaceUserdata {
-  public:
-    // Set the maximum free space allowed for this test. If /userdata has more space than the given
-    // number, a file is allocated to consume space.
-    AssertionResult Init(uint64_t max_free_space);
-
-    uint64_t free_space() const;
-    uint64_t available_space() const;
-    uint64_t bsize() const;
-
-  private:
-    AssertionResult ReadUserdataStats();
-
-    static constexpr const char* kUserDataDevice = "/data";
-    std::unique_ptr<TemporaryFile> big_file_;
-    bool initialized_ = false;
-    uint64_t free_space_ = 0;
-    uint64_t available_space_ = 0;
-    uint64_t bsize_ = 0;
-};
 
 bool IsVirtualAbEnabled();
 
@@ -199,6 +239,22 @@ bool IsVirtualAbEnabled();
     } while (0)
 
 #define RETURN_IF_NON_VIRTUAL_AB() RETURN_IF_NON_VIRTUAL_AB_MSG("")
+
+#define SKIP_IF_VENDOR_ON_ANDROID_S()                                        \
+    do {                                                                     \
+        if (IsVendorFromAndroid12())                                         \
+            GTEST_SKIP() << "Skip test as Vendor partition is on Android S"; \
+    } while (0)
+
+#define RETURN_IF_VENDOR_ON_ANDROID_S_MSG(msg) \
+    do {                                       \
+        if (IsVendorFromAndroid12()) {         \
+            std::cerr << (msg);                \
+            return;                            \
+        }                                      \
+    } while (0)
+
+#define RETURN_IF_VENDOR_ON_ANDROID_S() RETURN_IF_VENDOR_ON_ANDROID_S_MSG("")
 
 }  // namespace snapshot
 }  // namespace android

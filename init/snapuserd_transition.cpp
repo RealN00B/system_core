@@ -24,19 +24,25 @@
 
 #include <filesystem>
 #include <string>
+#include <string_view>
+#include <thread>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
+#include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <cutils/sockets.h>
+#include <fs_avb/fs_avb.h>
 #include <libsnapshot/snapshot.h>
-#include <libsnapshot/snapuserd_client.h>
 #include <private/android_filesystem_config.h>
+#include <procinfo/process_map.h>
 #include <selinux/android.h>
+#include <snapuserd/snapuserd_client.h>
 
 #include "block_dev_initializer.h"
+#include "lmkd_service.h"
 #include "service_utils.h"
 #include "util.h"
 
@@ -52,6 +58,7 @@ using android::snapshot::SnapuserdClient;
 static constexpr char kSnapuserdPath[] = "/system/bin/snapuserd";
 static constexpr char kSnapuserdFirstStagePidVar[] = "FIRST_STAGE_SNAPUSERD_PID";
 static constexpr char kSnapuserdFirstStageFdVar[] = "FIRST_STAGE_SNAPUSERD_FD";
+static constexpr char kSnapuserdFirstStageInfoVar[] = "FIRST_STAGE_SNAPUSERD_INFO";
 static constexpr char kSnapuserdLabel[] = "u:object_r:snapuserd_exec:s0";
 static constexpr char kSnapuserdSocketLabel[] = "u:object_r:snapuserd_socket:s0";
 
@@ -77,15 +84,33 @@ void LaunchFirstStageSnapuserd() {
     }
     if (pid == 0) {
         socket->Publish();
+
         char arg0[] = "/system/bin/snapuserd";
-        char* const argv[] = {arg0, nullptr};
+        char arg1[] = "-user_snapshot";
+        char* const argv[] = {arg0, arg1, nullptr};
         if (execv(arg0, argv) < 0) {
             PLOG(FATAL) << "Cannot launch snapuserd; execv failed";
         }
         _exit(127);
     }
 
+    auto client = SnapuserdClient::Connect(android::snapshot::kSnapuserdSocket, 10s);
+    if (!client) {
+        LOG(FATAL) << "Could not connect to first-stage snapuserd";
+    }
+    if (client->SupportsSecondStageSocketHandoff()) {
+        setenv(kSnapuserdFirstStageInfoVar, "socket", 1);
+        auto sm = SnapshotManager::NewForFirstStageMount();
+        if (!sm->MarkSnapuserdFromSystem()) {
+            LOG(ERROR) << "Failed to update MarkSnapuserdFromSystem";
+        }
+    }
+
     setenv(kSnapuserdFirstStagePidVar, std::to_string(pid).c_str(), 1);
+
+    if (!client->RemoveTransitionedDaemonIndicator()) {
+        LOG(ERROR) << "RemoveTransitionedDaemonIndicator failed";
+    }
 
     LOG(INFO) << "Relaunched snapuserd with pid: " << pid;
 }
@@ -157,6 +182,31 @@ SnapuserdSelinuxHelper::SnapuserdSelinuxHelper(std::unique_ptr<SnapshotManager>&
     });
 }
 
+static void LockAllSystemPages() {
+    bool ok = true;
+    auto callback = [&](const android::procinfo::MapInfo& map) -> void {
+        if (!ok || android::base::StartsWith(map.name, "/dev/") ||
+            !android::base::StartsWith(map.name, "/")) {
+            return;
+        }
+        auto start = reinterpret_cast<const void*>(map.start);
+        uint64_t len = android::procinfo::MappedFileSize(map);
+        if (!len) {
+            return;
+        }
+
+        if (mlock(start, len) < 0) {
+            PLOG(ERROR) << "\"" << map.name << "\": mlock(" << start << ", " << len
+                        << ") failed: pgoff = " << map.pgoff;
+            ok = false;
+        }
+    };
+
+    if (!android::procinfo::ReadProcessMaps(getpid(), callback) || !ok) {
+        LOG(FATAL) << "Could not process /proc/" << getpid() << "/maps file for init";
+    }
+}
+
 void SnapuserdSelinuxHelper::StartTransition() {
     LOG(INFO) << "Starting SELinux transition of snapuserd";
 
@@ -170,18 +220,13 @@ void SnapuserdSelinuxHelper::StartTransition() {
 
     // We cannot access /system after the transition, so make sure init is
     // pinned in memory.
-    if (mlockall(MCL_CURRENT) < 0) {
-        LOG(FATAL) << "mlockall failed";
-    }
+    LockAllSystemPages();
 
     argv_.emplace_back("snapuserd");
     argv_.emplace_back("-no_socket");
-    if (!sm_->DetachSnapuserdForSelinux(&argv_)) {
+    if (!sm_->PrepareSnapuserdArgsForSelinux(&argv_)) {
         LOG(FATAL) << "Could not perform selinux transition";
     }
-
-    // Make sure the process is gone so we don't have any selinux audits.
-    KillFirstStageSnapuserd(old_pid_);
 }
 
 void SnapuserdSelinuxHelper::FinishTransition() {
@@ -200,7 +245,76 @@ void SnapuserdSelinuxHelper::FinishTransition() {
     }
 }
 
+/*
+ * Before starting init second stage, we will wait
+ * for snapuserd daemon to be up and running; bionic libc
+ * may read /system/etc/selinux/plat_property_contexts file
+ * before invoking main() function. This will happen if
+ * init initializes property during second stage. Any access
+ * to /system without snapuserd daemon will lead to a deadlock.
+ *
+ * Thus, we do a simple probe by reading system partition. This
+ * read will eventually be serviced by daemon confirming that
+ * daemon is up and running. Furthermore, we are still in the kernel
+ * domain and sepolicy has not been enforced yet. Thus, access
+ * to these device mapper block devices are ok even though
+ * we may see audit logs.
+ */
+bool SnapuserdSelinuxHelper::TestSnapuserdIsReady() {
+    // Wait for the daemon to be fully up. Daemon will write to path
+    // /metadata/ota/daemon-alive-indicator only when all the threads
+    // are ready and attached to dm-user.
+    //
+    // This check will fail for GRF devices with vendor on Android S.
+    // snapuserd binary from Android S won't be able to communicate
+    // and hence, we will fallback and issue I/O to verify
+    // the presence of daemon.
+    auto client = std::make_unique<SnapuserdClient>();
+    if (!client->IsTransitionedDaemonReady()) {
+        LOG(ERROR) << "IsTransitionedDaemonReady failed";
+    }
+
+    std::string dev = "/dev/block/mapper/system"s + fs_mgr_get_slot_suffix();
+    android::base::unique_fd fd(open(dev.c_str(), O_RDONLY | O_DIRECT));
+    if (fd < 0) {
+        PLOG(ERROR) << "open " << dev << " failed";
+        return false;
+    }
+
+    void* addr;
+    ssize_t page_size = getpagesize();
+    if (posix_memalign(&addr, page_size, page_size) < 0) {
+        PLOG(ERROR) << "posix_memalign with page size " << page_size;
+        return false;
+    }
+
+    std::unique_ptr<void, decltype(&::free)> buffer(addr, ::free);
+
+    int iter = 0;
+    while (iter < 10) {
+        ssize_t n = TEMP_FAILURE_RETRY(pread(fd.get(), buffer.get(), page_size, 0));
+        if (n < 0) {
+            // Wait for sometime before retry
+            std::this_thread::sleep_for(100ms);
+        } else if (n == page_size) {
+            return true;
+        } else {
+            LOG(ERROR) << "pread returned: " << n << " from: " << dev << " expected: " << page_size;
+        }
+
+        iter += 1;
+    }
+
+    return false;
+}
+
 void SnapuserdSelinuxHelper::RelaunchFirstStageSnapuserd() {
+    if (!sm_->DetachFirstStageSnapuserdForSelinux()) {
+        LOG(FATAL) << "Could not perform selinux transition";
+    }
+
+    KillFirstStageSnapuserd(old_pid_);
+
     auto fd = GetRamdiskSnapuserdFd();
     if (!fd) {
         LOG(FATAL) << "Environment variable " << kSnapuserdFirstStageFdVar << " was not set!";
@@ -221,6 +335,21 @@ void SnapuserdSelinuxHelper::RelaunchFirstStageSnapuserd() {
         setenv(kSnapuserdFirstStagePidVar, std::to_string(pid).c_str(), 1);
 
         LOG(INFO) << "Relaunched snapuserd with pid: " << pid;
+
+        // Since daemon is not started as a service, we have
+        // to explicitly set the OOM score to default which is unkillable
+        std::string oom_str = std::to_string(DEFAULT_OOM_SCORE_ADJUST);
+        std::string oom_file = android::base::StringPrintf("/proc/%d/oom_score_adj", pid);
+        if (!android::base::WriteStringToFile(oom_str, oom_file)) {
+            PLOG(ERROR) << "couldn't write oom_score_adj to snapuserd daemon with pid: " << pid;
+        }
+
+        if (!TestSnapuserdIsReady()) {
+            PLOG(FATAL) << "snapuserd daemon failed to launch";
+        } else {
+            LOG(INFO) << "snapuserd daemon is up and running";
+        }
+
         return;
     }
 
@@ -299,6 +428,14 @@ void SaveRamdiskPathToSnapuserd() {
 
 bool IsFirstStageSnapuserdRunning() {
     return GetSnapuserdFirstStagePid().has_value();
+}
+
+std::vector<std::string> GetSnapuserdFirstStageInfo() {
+    const char* pid_str = getenv(kSnapuserdFirstStageInfoVar);
+    if (!pid_str) {
+        return {};
+    }
+    return android::base::Split(pid_str, ",");
 }
 
 }  // namespace init

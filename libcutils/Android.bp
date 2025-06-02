@@ -1,44 +1,15 @@
-//
-// Copyright (C) 2008 The Android Open Source Project
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-
 package {
+    default_team: "trendy_team_native_tools_libraries",
     default_applicable_licenses: ["system_core_libcutils_license"],
 }
 
-// Added automatically by a large-scale-change that took the approach of
-// 'apply every license found to every target'. While this makes sure we respect
-// every license restriction, it may not be entirely correct.
-//
-// e.g. GPL in an MIT project might only apply to the contrib/ directory.
-//
-// Please consider splitting the single license below into multiple licenses,
-// taking care not to lose any license_kind information, and overriding the
-// default license using the 'licenses: [...]' property on targets as needed.
-//
-// For unused files, consider creating a 'fileGroup' with "//visibility:private"
-// to attach the license to, and including a comment whether the files may be
-// used in the current project.
-// See: http://go/android-license-faq
 license {
     name: "system_core_libcutils_license",
     visibility: [":__subpackages__"],
     license_kinds: [
         "SPDX-license-identifier-Apache-2.0",
         "SPDX-license-identifier-BSD",
-        "SPDX-license-identifier-MIT",
+        "SPDX-license-identifier-MIT", // strlcpy.c
     ],
     license_text: [
         "NOTICE",
@@ -50,31 +21,46 @@ filegroup {
     srcs: ["include/private/android_filesystem_config.h"],
 }
 
-// some files must not be compiled when building against Mingw
-// they correspond to features not used by our host development tools
-// which are also hard or even impossible to port to native Win32
-libcutils_nonwindows_sources = [
-    "fs.cpp",
-    "hashmap.cpp",
-    "multiuser.cpp",
-    "str_parms.cpp",
-]
+rust_bindgen {
+    name: "libandroid_ids",
+    crate_name: "android_ids",
+    source_stem: "bindings",
+    wrapper_src: "rust/aid_bindings.h",
+    header_libs: ["libcutils_headers"],
+    visibility: [
+        "//system/bpf/loader",
+    ],
+}
 
-cc_library_headers {
-    name: "libcutils_headers",
-    vendor_available: true,
+cc_defaults {
+    name: "libcutils_defaults",
+    cflags: [
+        "-Wno-exit-time-destructors",
+    ],
+
     product_available: true,
-    recovery_available: true,
     ramdisk_available: true,
+    recovery_available: true,
+    vendor_available: true,
     vendor_ramdisk_available: true,
+
     host_supported: true,
+    native_bridge_supported: true,
+
     apex_available: [
         "//apex_available:platform",
         "//apex_available:anyapex",
     ],
     min_sdk_version: "29",
-    native_bridge_supported: true,
+}
+
+cc_library_headers {
+    name: "libcutils_headers",
+    defaults: ["libcutils_defaults"],
+
     export_include_dirs: ["include"],
+    header_libs: ["libprocessgroup_headers"],
+    export_header_lib_headers: ["libprocessgroup_headers"],
     target: {
         vendor: {
             override_export_include_dirs: ["include_outside_system"],
@@ -94,18 +80,7 @@ cc_library_headers {
 // Socket specific parts of libcutils that are safe to statically link into an APEX.
 cc_library {
     name: "libcutils_sockets",
-    vendor_available: true,
-    product_available: true,
-    recovery_available: true,
-    ramdisk_available: true,
-    vendor_ramdisk_available: true,
-    host_supported: true,
-    native_bridge_supported: true,
-    apex_available: [
-        "//apex_available:platform",
-        "//apex_available:anyapex",
-    ],
-    min_sdk_version: "29",
+    defaults: ["libcutils_defaults"],
 
     export_include_dirs: ["include"],
 
@@ -155,116 +130,72 @@ cc_library {
     },
 }
 
-cc_test {
-    name: "libcutils_sockets_test",
-    test_suites: ["device-tests"],
-    static_libs: ["libbase", "libcutils_sockets"],
-    cflags: [
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-    ],
-
-    srcs: ["sockets_test.cpp"],
-    target: {
-        android: {
-            srcs: [
-                "android_get_control_file_test.cpp",
-                "android_get_control_socket_test.cpp",
-            ],
-        },
-    },
-}
+// some files must not be compiled when building against Mingw
+// they correspond to features not used by our host development tools
+// which are also hard or even impossible to port to native Win32
+libcutils_nonwindows_sources = [
+    "fs.cpp",
+    "hashmap.cpp",
+    "multiuser.cpp",
+    "str_parms.cpp",
+]
 
 cc_library {
     name: "libcutils",
-    vendor_available: true,
-    product_available: true,
-    vndk: {
-        enabled: true,
-        support_system_process: true,
-    },
-    recovery_available: true,
-    vendor_ramdisk_available: true,
-    host_supported: true,
-    apex_available: [
-        "//apex_available:platform",
-        "//apex_available:anyapex",
-    ],
-    min_sdk_version: "29",
-    native_bridge_supported: true,
+    defaults: ["libcutils_defaults"],
+    double_loadable: true,
     srcs: [
         "config_utils.cpp",
-        "canned_fs_config.cpp",
         "iosched_policy.cpp",
         "load_file.cpp",
         "native_handle.cpp",
         "properties.cpp",
         "record_stream.cpp",
         "strlcpy.c",
-        "threads.cpp",
     ],
 
     target: {
         linux_bionic: {
             enabled: true,
-        },
-        not_windows: {
-            srcs: libcutils_nonwindows_sources + [
-                "ashmem-host.cpp",
-                "fs_config.cpp",
-                "trace-host.cpp",
+            static_libs: [
+                "libasync_safe",
             ],
         },
-        windows: {
-            host_ldlibs: ["-lws2_32"],
-
+        linux: {
+            srcs: [
+                "canned_fs_config.cpp",
+                "fs_config.cpp",
+            ],
+        },
+        host: {
             srcs: [
                 "trace-host.cpp",
-            ],
-
-            enabled: true,
-            cflags: [
-                "-D_GNU_SOURCE",
+                "ashmem-host.cpp",
             ],
         },
+        not_windows: {
+            srcs: libcutils_nonwindows_sources,
+        },
+        windows: {
+            enabled: true,
+            host_ldlibs: ["-lws2_32"],
+        },
         android: {
+            sanitize: {
+                misc_undefined: ["integer"],
+            },
+            static_libs: [
+                "libasync_safe",
+            ],
             srcs: libcutils_nonwindows_sources + [
                 "android_reboot.cpp",
                 "ashmem-dev.cpp",
-                "fs_config.cpp",
                 "klog.cpp",
                 "partition_utils.cpp",
                 "qtaguid.cpp",
                 "trace-dev.cpp",
                 "uevent.cpp",
             ],
-        },
-
-        android_arm: {
-            sanitize: {
-                misc_undefined: ["integer"],
-            },
-        },
-        android_arm64: {
-            sanitize: {
-                misc_undefined: ["integer"],
-            },
-        },
-
-        android_x86: {
-            // TODO: This is to work around b/29412086.
-            // Remove once __mulodi4 is available and move the "sanitize" block
-            // to the android target.
-            sanitize: {
-                misc_undefined: [],
-            },
-        },
-
-        android_x86_64: {
-            sanitize: {
-                misc_undefined: ["integer"],
-            },
         },
 
         // qtaguid.cpp loads libnetd_client.so with dlopen().  Since
@@ -274,11 +205,19 @@ cc_library {
             exclude_srcs: [
                 "qtaguid.cpp",
             ],
+            header_abi_checker: {
+                enabled: true,
+                ref_dump_dirs: ["abi-dumps"],
+            },
         },
         product: {
             exclude_srcs: [
                 "qtaguid.cpp",
             ],
+            header_abi_checker: {
+                enabled: true,
+                ref_dump_dirs: ["abi-dumps"],
+            },
         },
     },
 
@@ -290,7 +229,6 @@ cc_library {
     header_libs: [
         "libbase_headers",
         "libcutils_headers",
-        "libutils_headers",
         "libprocessgroup_headers",
     ],
     export_header_lib_headers: [
@@ -309,6 +247,7 @@ cc_library {
 cc_defaults {
     name: "libcutils_test_default",
     srcs: [
+        "ashmem_base_test.cpp",
         "native_handle_test.cpp",
         "properties_test.cpp",
         "sockets_test.cpp",
@@ -342,13 +281,15 @@ cc_defaults {
     ],
 }
 
+always_static_test_libraries = [
+    "libjsoncpp",
+]
+
 test_libraries = [
     "libcutils",
     "liblog",
     "libbase",
-    "libjsoncpp",
     "libprocessgroup",
-    "libcgrouprc",
 ]
 
 cc_test {
@@ -357,26 +298,33 @@ cc_test {
     defaults: ["libcutils_test_default"],
     host_supported: true,
     shared_libs: test_libraries,
+    static_libs: always_static_test_libraries,
     require_root: true,
 }
 
 cc_defaults {
     name: "libcutils_test_static_defaults",
     defaults: ["libcutils_test_default"],
-    static_libs: [
-        "libc",
-        "libcgrouprc_format",
-    ] + test_libraries,
     stl: "libc++_static",
     require_root: true,
 
     target: {
         android: {
             static_executable: true,
+            static_libs: [
+                "libprocessgroup_util",
+            ] + test_libraries + always_static_test_libraries,
+        },
+        not_windows: {
+            static_libs: test_libraries + always_static_test_libraries,
         },
         windows: {
+            static_libs: [
+                "libbase",
+                "libcutils",
+                "libcutils_sockets",
+            ],
             host_ldlibs: ["-lws2_32"],
-
             enabled: true,
         },
     },
@@ -384,13 +332,17 @@ cc_defaults {
 
 cc_test {
     name: "libcutils_test_static",
+    host_supported: true,
     test_suites: ["device-tests"],
     defaults: ["libcutils_test_static_defaults"],
 }
 
 cc_test {
     name: "KernelLibcutilsTest",
-    test_suites: ["general-tests", "vts"],
+    test_suites: [
+        "general-tests",
+        "vts",
+    ],
     defaults: ["libcutils_test_static_defaults"],
     test_config: "KernelLibcutilsTest.xml",
 }

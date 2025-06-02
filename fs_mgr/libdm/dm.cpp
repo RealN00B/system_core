@@ -20,6 +20,7 @@
 #include <sys/ioctl.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 
 #include <chrono>
 #include <functional>
@@ -34,6 +35,13 @@
 #include <uuid/uuid.h>
 
 #include "utility.h"
+
+#ifndef DM_DEFERRED_REMOVE
+#define DM_DEFERRED_REMOVE (1 << 17)
+#endif
+#ifndef DM_IMA_MEASUREMENT_FLAG
+#define DM_IMA_MEASUREMENT_FLAG (1 << 19)
+#endif
 
 namespace android {
 namespace dm {
@@ -101,6 +109,10 @@ bool DeviceMapper::DeleteDevice(const std::string& name,
     if (!GetDeviceUniquePath(name, &unique_path)) {
         LOG(ERROR) << "Failed to get unique path for device " << name;
     }
+    // Expect to have uevent generated if the unique path actually exists. This may not exist
+    // if the device was created but has never been activated before it gets deleted.
+    bool need_uevent = !unique_path.empty() && access(unique_path.c_str(), F_OK) == 0;
+
     struct dm_ioctl io;
     InitIo(&io, name);
 
@@ -111,7 +123,7 @@ bool DeviceMapper::DeleteDevice(const std::string& name,
 
     // Check to make sure appropriate uevent is generated so ueventd will
     // do the right thing and remove the corresponding device node and symlinks.
-    if ((io.flags & DM_UEVENT_GENERATED_FLAG) == 0) {
+    if (need_uevent && (io.flags & DM_UEVENT_GENERATED_FLAG) == 0) {
         LOG(ERROR) << "Didn't generate uevent for [" << name << "] removal";
         return false;
     }
@@ -133,6 +145,25 @@ bool DeviceMapper::DeleteDevice(const std::string& name) {
     return DeleteDevice(name, 0ms);
 }
 
+bool DeviceMapper::DeleteDeviceDeferred(const std::string& name) {
+    struct dm_ioctl io;
+    InitIo(&io, name);
+
+    io.flags |= DM_DEFERRED_REMOVE;
+    if (ioctl(fd_, DM_DEV_REMOVE, &io)) {
+        PLOG(ERROR) << "DM_DEV_REMOVE with DM_DEFERRED_REMOVE failed for [" << name << "]";
+        return false;
+    }
+    return true;
+}
+
+bool DeviceMapper::DeleteDeviceIfExistsDeferred(const std::string& name) {
+    if (GetState(name) == DmDeviceState::INVALID) {
+        return true;
+    }
+    return DeleteDeviceDeferred(name);
+}
+
 static std::string GenerateUuid() {
     uuid_t uuid_bytes;
     uuid_generate(uuid_bytes);
@@ -147,19 +178,18 @@ static bool IsRecovery() {
     return access("/system/bin/recovery", F_OK) == 0;
 }
 
-bool DeviceMapper::CreateDevice(const std::string& name, const DmTable& table, std::string* path,
-                                const std::chrono::milliseconds& timeout_ms) {
+bool DeviceMapper::CreateEmptyDevice(const std::string& name) {
     std::string uuid = GenerateUuid();
-    if (!CreateDevice(name, uuid)) {
-        return false;
-    }
+    return CreateDevice(name, uuid);
+}
 
+bool DeviceMapper::WaitForDevice(const std::string& name,
+                                 const std::chrono::milliseconds& timeout_ms, std::string* path) {
     // We use the unique path for testing whether the device is ready. After
     // that, it's safe to use the dm-N path which is compatible with callers
     // that expect it to be formatted as such.
     std::string unique_path;
-    if (!LoadTableAndActivate(name, table) || !GetDeviceUniquePath(name, &unique_path) ||
-        !GetDmDevicePathByName(name, path)) {
+    if (!GetDeviceUniquePath(name, &unique_path) || !GetDmDevicePathByName(name, path)) {
         DeleteDevice(name);
         return false;
     }
@@ -185,6 +215,25 @@ bool DeviceMapper::CreateDevice(const std::string& name, const DmTable& table, s
     return true;
 }
 
+bool DeviceMapper::CreateDevice(const std::string& name, const DmTable& table, std::string* path,
+                                const std::chrono::milliseconds& timeout_ms) {
+    if (!CreateEmptyDevice(name)) {
+        return false;
+    }
+
+    if (!LoadTableAndActivate(name, table)) {
+        DeleteDevice(name);
+        return false;
+    }
+
+    if (!WaitForDevice(name, timeout_ms, path)) {
+        DeleteDevice(name);
+        return false;
+    }
+
+    return true;
+}
+
 bool DeviceMapper::GetDeviceUniquePath(const std::string& name, std::string* path) {
     struct dm_ioctl io;
     InitIo(&io, name);
@@ -198,6 +247,25 @@ bool DeviceMapper::GetDeviceUniquePath(const std::string& name, std::string* pat
         return false;
     }
     *path = "/dev/block/mapper/by-uuid/"s + io.uuid;
+    return true;
+}
+
+bool DeviceMapper::GetDeviceNameAndUuid(dev_t dev, std::string* name, std::string* uuid) {
+    struct dm_ioctl io;
+    InitIo(&io, {});
+    io.dev = dev;
+
+    if (ioctl(fd_, DM_DEV_STATUS, &io) < 0) {
+        PLOG(ERROR) << "Failed to find device dev: " << major(dev) << ":" << minor(dev);
+        return false;
+    }
+
+    if (name) {
+        *name = io.name;
+    }
+    if (uuid) {
+        *uuid = io.uuid;
+    }
     return true;
 }
 
@@ -248,7 +316,7 @@ bool DeviceMapper::CreateDevice(const std::string& name, const DmTable& table) {
     return true;
 }
 
-bool DeviceMapper::LoadTableAndActivate(const std::string& name, const DmTable& table) {
+bool DeviceMapper::LoadTable(const std::string& name, const DmTable& table) {
     std::string ioctl_buffer(sizeof(struct dm_ioctl), 0);
     ioctl_buffer += table.Serialize();
 
@@ -264,9 +332,17 @@ bool DeviceMapper::LoadTableAndActivate(const std::string& name, const DmTable& 
         PLOG(ERROR) << "DM_TABLE_LOAD failed";
         return false;
     }
+    return true;
+}
 
-    InitIo(io, name);
-    if (ioctl(fd_, DM_DEV_SUSPEND, io)) {
+bool DeviceMapper::LoadTableAndActivate(const std::string& name, const DmTable& table) {
+    if (!LoadTable(name, table)) {
+        return false;
+    }
+
+    struct dm_ioctl io;
+    InitIo(&io, name);
+    if (ioctl(fd_, DM_DEV_SUSPEND, &io)) {
         PLOG(ERROR) << "DM_TABLE_SUSPEND resume failed";
         return false;
     }
@@ -467,8 +543,23 @@ bool DeviceMapper::GetTableStatus(const std::string& name, std::vector<TargetInf
     return GetTable(name, 0, table);
 }
 
+bool DeviceMapper::GetTableStatusIma(const std::string& name, std::vector<TargetInfo>* table) {
+    return GetTable(name, DM_IMA_MEASUREMENT_FLAG, table);
+}
+
 bool DeviceMapper::GetTableInfo(const std::string& name, std::vector<TargetInfo>* table) {
     return GetTable(name, DM_STATUS_TABLE_FLAG, table);
+}
+
+void RedactTableInfo(const struct dm_target_spec& spec, std::string* data) {
+    if (DeviceMapper::GetTargetType(spec) == "crypt") {
+        auto parts = android::base::Split(*data, " ");
+        if (parts.size() < 2) {
+            return;
+        }
+        parts[1] = "redacted";
+        *data = android::base::Join(parts, " ");
+    }
 }
 
 // private methods of DeviceMapper
@@ -509,6 +600,9 @@ bool DeviceMapper::GetTable(const std::string& name, uint32_t flags,
             // Note: we use c_str() to eliminate any extra trailing 0s.
             data = std::string(&buffer[data_offset], next_cursor - data_offset).c_str();
         }
+        if (flags & DM_STATUS_TABLE_FLAG) {
+            RedactTableInfo(*spec, &data);
+        }
         table->emplace_back(*spec, data);
         cursor = next_cursor;
     }
@@ -537,34 +631,34 @@ std::string DeviceMapper::GetTargetType(const struct dm_target_spec& spec) {
     return std::string{spec.target_type, sizeof(spec.target_type)};
 }
 
-static bool ExtractBlockDeviceName(const std::string& path, std::string* name) {
+std::optional<std::string> ExtractBlockDeviceName(const std::string& path) {
     static constexpr std::string_view kDevBlockPrefix("/dev/block/");
-    if (android::base::StartsWith(path, kDevBlockPrefix)) {
-        *name = path.substr(kDevBlockPrefix.length());
-        return true;
+    std::string real_path;
+    if (!android::base::Realpath(path, &real_path)) {
+        real_path = path;
     }
-    return false;
+    if (android::base::StartsWith(real_path, kDevBlockPrefix)) {
+        return real_path.substr(kDevBlockPrefix.length());
+    }
+    return {};
 }
 
 bool DeviceMapper::IsDmBlockDevice(const std::string& path) {
-    std::string name;
-    if (!ExtractBlockDeviceName(path, &name)) {
-        return false;
-    }
-    return android::base::StartsWith(name, "dm-");
+    std::optional<std::string> name = ExtractBlockDeviceName(path);
+    return name && android::base::StartsWith(*name, "dm-");
 }
 
 std::optional<std::string> DeviceMapper::GetDmDeviceNameByPath(const std::string& path) {
-    std::string name;
-    if (!ExtractBlockDeviceName(path, &name)) {
+    std::optional<std::string> name = ExtractBlockDeviceName(path);
+    if (!name) {
         LOG(WARNING) << path << " is not a block device";
         return std::nullopt;
     }
-    if (!android::base::StartsWith(name, "dm-")) {
+    if (!android::base::StartsWith(*name, "dm-")) {
         LOG(WARNING) << path << " is not a dm device";
         return std::nullopt;
     }
-    std::string dm_name_file = "/sys/block/" + name + "/dm/name";
+    std::string dm_name_file = "/sys/block/" + *name + "/dm/name";
     std::string dm_name;
     if (!android::base::ReadFileToString(dm_name_file, &dm_name)) {
         PLOG(ERROR) << "Failed to read file " << dm_name_file;
@@ -575,16 +669,16 @@ std::optional<std::string> DeviceMapper::GetDmDeviceNameByPath(const std::string
 }
 
 std::optional<std::string> DeviceMapper::GetParentBlockDeviceByPath(const std::string& path) {
-    std::string name;
-    if (!ExtractBlockDeviceName(path, &name)) {
+    std::optional<std::string> name = ExtractBlockDeviceName(path);
+    if (!name) {
         LOG(WARNING) << path << " is not a block device";
         return std::nullopt;
     }
-    if (!android::base::StartsWith(name, "dm-")) {
+    if (!android::base::StartsWith(*name, "dm-")) {
         // Reached bottom of the device mapper stack.
         return std::nullopt;
     }
-    auto slaves_dir = "/sys/block/" + name + "/slaves";
+    auto slaves_dir = "/sys/block/" + *name + "/slaves";
     auto dir = std::unique_ptr<DIR, decltype(&closedir)>(opendir(slaves_dir.c_str()), closedir);
     if (dir == nullptr) {
         PLOG(ERROR) << "Failed to open: " << slaves_dir;
@@ -608,6 +702,105 @@ std::optional<std::string> DeviceMapper::GetParentBlockDeviceByPath(const std::s
 
 bool DeviceMapper::TargetInfo::IsOverflowSnapshot() const {
     return spec.target_type == "snapshot"s && data == "Overflow"s;
+}
+
+// Find directories in format of "/sys/block/dm-X".
+static int DmNameFilter(const dirent* de) {
+    if (android::base::StartsWith(de->d_name, "dm-")) {
+        return 1;
+    }
+    return 0;
+}
+
+std::map<std::string, std::string> DeviceMapper::FindDmPartitions() {
+    static constexpr auto DM_PATH_PREFIX = "/sys/block/";
+    dirent** namelist;
+    int n = scandir(DM_PATH_PREFIX, &namelist, DmNameFilter, alphasort);
+    if (n == -1) {
+        PLOG(ERROR) << "Failed to scan dir " << DM_PATH_PREFIX;
+        return {};
+    }
+    if (n == 0) {
+        LOG(ERROR) << "No dm block device found.";
+        free(namelist);
+        return {};
+    }
+
+    static constexpr auto DM_PATH_SUFFIX = "/dm/name";
+    static constexpr auto DEV_PATH = "/dev/block/";
+    std::map<std::string, std::string> dm_block_devices;
+    while (n--) {
+        std::string path = DM_PATH_PREFIX + std::string(namelist[n]->d_name) + DM_PATH_SUFFIX;
+        std::string content;
+        if (!android::base::ReadFileToString(path, &content)) {
+            PLOG(WARNING) << "Failed to read " << path;
+        } else {
+            std::string dm_block_name = android::base::Trim(content);
+            // AVB is using 'vroot' for the root block device but we're expecting 'system'.
+            if (dm_block_name == "vroot") {
+                dm_block_name = "system";
+            } else if (android::base::EndsWith(dm_block_name, "-verity")) {
+                auto npos = dm_block_name.rfind("-verity");
+                dm_block_name = dm_block_name.substr(0, npos);
+            } else if (!android::base::GetProperty("ro.boot.avb_version", "").empty()) {
+                // Verified Boot 1.0 doesn't add a -verity suffix. On AVB 2 devices,
+                // if DAP is enabled, then a -verity suffix must be used to
+                // differentiate between dm-linear and dm-verity devices. If we get
+                // here, we're AVB 2 and looking at a non-verity partition.
+                free(namelist[n]);
+                continue;
+            }
+
+            dm_block_devices.emplace(dm_block_name, DEV_PATH + std::string(namelist[n]->d_name));
+        }
+        free(namelist[n]);
+    }
+    free(namelist);
+
+    return dm_block_devices;
+}
+
+bool DeviceMapper::CreatePlaceholderDevice(const std::string& name) {
+    if (!CreateEmptyDevice(name)) {
+        return false;
+    }
+
+    struct utsname uts;
+    unsigned int major, minor;
+    if (uname(&uts) != 0 || sscanf(uts.release, "%u.%u", &major, &minor) != 2) {
+        LOG(ERROR) << "Could not parse the kernel version from uname";
+        return true;
+    }
+
+    // On Linux 5.15+, there is no uevent until DM_TABLE_LOAD.
+    if (major > 5 || (major == 5 && minor >= 15)) {
+        DmTable table;
+        table.Emplace<DmTargetError>(0, 1);
+        if (!LoadTable(name, table)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool DeviceMapper::SendMessage(const std::string& name, uint64_t sector,
+                               const std::string& message) {
+    std::string ioctl_buffer(sizeof(struct dm_ioctl) + sizeof(struct dm_target_msg), 0);
+    ioctl_buffer += message;
+    ioctl_buffer.push_back('\0');
+
+    struct dm_ioctl* io = reinterpret_cast<struct dm_ioctl*>(&ioctl_buffer[0]);
+    InitIo(io, name);
+    io->data_size = ioctl_buffer.size();
+    io->data_start = sizeof(struct dm_ioctl);
+    struct dm_target_msg* msg =
+            reinterpret_cast<struct dm_target_msg*>(&ioctl_buffer[sizeof(struct dm_ioctl)]);
+    msg->sector = sector;
+    if (ioctl(fd_, DM_TARGET_MSG, io)) {
+        PLOG(ERROR) << "DM_TARGET_MSG failed";
+        return false;
+    }
+    return true;
 }
 
 }  // namespace dm

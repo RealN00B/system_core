@@ -30,8 +30,7 @@ namespace init {
 android::base::Result<ServiceInterfacesMap> GetOnDeviceServiceInterfacesMap() {
     ServiceList& service_list = ServiceList::GetInstance();
     Parser parser;
-    parser.AddSectionParser("service",
-                            std::make_unique<ServiceParser>(&service_list, nullptr, std::nullopt));
+    parser.AddSectionParser("service", std::make_unique<ServiceParser>(&service_list, nullptr));
     for (const auto& location : {
                  "/init.rc",
                  "/system/etc/init",
@@ -44,7 +43,7 @@ android::base::Result<ServiceInterfacesMap> GetOnDeviceServiceInterfacesMap() {
     }
 
     ServiceInterfacesMap result;
-    for (const auto& service : service_list.services()) {
+    for (const auto& service : service_list) {
         // Create an entry for all services, including services that may not
         // have any declared interfaces.
         result[service->name()] = service->interfaces();

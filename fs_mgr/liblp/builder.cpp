@@ -383,11 +383,6 @@ static bool VerifyDeviceProperties(const BlockDeviceInfo& device_info) {
                << " partition alignment is not sector-aligned.";
         return false;
     }
-    if (device_info.alignment_offset > device_info.alignment) {
-        LERROR << "Block device " << device_info.partition_name
-               << " partition alignment offset is greater than its alignment.";
-        return false;
-    }
     return true;
 }
 
@@ -489,7 +484,7 @@ bool MetadataBuilder::Init(const std::vector<BlockDeviceInfo>& block_devices,
     // Compute the first free sector, factoring in alignment.
     uint64_t free_area_start = total_reserved;
     bool ok;
-    if (super.alignment || super.alignment_offset) {
+    if (super.alignment) {
         ok = AlignTo(free_area_start, super.alignment, &free_area_start);
     } else {
         ok = AlignTo(free_area_start, logical_block_size, &free_area_start);
@@ -1214,6 +1209,15 @@ void MetadataBuilder::SetAutoSlotSuffixing() {
 void MetadataBuilder::SetVirtualABDeviceFlag() {
     RequireExpandedMetadataHeader();
     header_.flags |= LP_HEADER_FLAG_VIRTUAL_AB_DEVICE;
+}
+
+void MetadataBuilder::SetOverlaysActiveFlag(bool flag) {
+    RequireExpandedMetadataHeader();
+    if (flag) {
+        header_.flags |= LP_HEADER_FLAG_OVERLAYS_ACTIVE;
+    } else {
+        header_.flags &= ~LP_HEADER_FLAG_OVERLAYS_ACTIVE;
+    }
 }
 
 bool MetadataBuilder::IsABDevice() {

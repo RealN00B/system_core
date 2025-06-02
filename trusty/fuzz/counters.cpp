@@ -16,12 +16,12 @@
 
 #define LOG_TAG "trusty-fuzz-counters"
 
-#include <FuzzerDefs.h>
-
 #include <trusty/fuzz/counters.h>
 
 #include <android-base/logging.h>
+#include <assert.h>
 #include <log/log.h>
+#include <string.h>
 #include <trusty/coverage/coverage.h>
 #include <trusty/coverage/tipc.h>
 
@@ -33,7 +33,7 @@ using android::base::Result;
  * We don't know how many counters the coverage record will contain. So, eyeball
  * the size of this section.
  */
-static const size_t kMaxNumCounters = 0x4000;
+static const size_t kMaxNumCounters = 0x10000;
 __attribute__((section("__libfuzzer_extra_counters"))) volatile uint8_t counters[kMaxNumCounters];
 
 namespace android {
@@ -44,9 +44,6 @@ ExtraCounters::ExtraCounters(coverage::CoverageRecord* record) : record_(record)
     if (!record_->IsOpen()) {
         return;
     }
-
-    assert(fuzzer::ExtraCountersBegin());
-    assert(fuzzer::ExtraCountersEnd());
 
     volatile uint8_t* begin = NULL;
     volatile uint8_t* end = NULL;
@@ -66,9 +63,8 @@ void ExtraCounters::Reset() {
     if (!record_->IsOpen()) {
         return;
     }
-
     record_->ResetCounts();
-    fuzzer::ClearExtraCounters();
+    memset_explicit(const_cast<uint8_t*>(counters), 0, sizeof(counters));
 }
 
 void ExtraCounters::Flush() {

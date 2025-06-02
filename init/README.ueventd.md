@@ -39,6 +39,33 @@ for the node path:
      `device_id` is `uevent MINOR % 128 + 1`.
   3. All other devices are created as `/dev/<basename uevent DEVPATH>`
 
+Whether a device is considered a "boot device" is a bit complicated.
+
+ - The recommended way to specify the boot device is to provide the "partition UUID" containing the
+   kernel (or, really, any parition on the boot device) and then boot device is the block device
+   containing that partition. This is passed via `androidboot.boot_part_uuid` which can be provided
+   either via the kernel bootconfig or via the kernel commandline. As an example, you could set
+   `androidboot.boot_part_uuid=12345678-abcd-ef01-0234-6789abcdef01`.
+ - Though using `boot_part_uuid` is preferred, you can also specify the boot device via
+   `androidboot.boot_device` or `androidboot.boot_devices`. These can be passed via the kernel
+   bootconfig or the kernel command line. It is also possible to pass this via device tree by
+   creating a `boot_devices` property in the Android firmware node. In most cases the `boot_device`
+   is the sysfs path (without the `/sys/devices` or `/sys/devices/platform` prefix) to the closest
+   parent of the block device that's on the "platform" bus. As an example, if the block device is
+   `/sys/devices/platform/soc@0/7c4000.mmc/mmc_host/mmc1/mmc1:0001/block/mmcblk1` then the
+   `boot_device` is `soc@0/7c4000.mmc` since we strip off the `/sys/devices/platform` and nothing
+   past the `7c4000.mmc` directory represents a device on the "platform" bus. In the case that none
+   of the parents are on the "platform" bus there are special rules for block devices under PCI
+   and VBD (Virtual Block Device). NOTE: sysfs paths for block devices are not guaranteed to be
+   stable between kernel versions, which is one of the reasons why it is suggested to use
+   `boot_part_uuid` instead of `boot_devices`. ALSO NOTE: If more than one device matches (either
+   because multiple `boot_devices` were listed or because there was more than one block device
+   under the found sysfs directory) and these multiple matching devices provide some of the same
+   named partitions then the behavior is unspecified.
+ - There is a further fallback to determine "boot devices" via the vstab, but providing at least
+   `boot_devices` has been required since Android 12 so this further fallback will not be described
+   here.
+
 The permissions can be modified using a ueventd.rc script and a line that beings with `/dev`. These
 lines take the format of
 
@@ -49,19 +76,20 @@ For example
 When `/dev/null` is created, its mode will be set to `0666`, its user to `root` and its group to
 `root`.
 
-The path can be modified using a ueventd.rc script and a `subsystem` section. There are three to set
-for a subsystem: the subsystem name, which device name to use, and which directory to place the
-device in. The section takes the below format of
+The path can be modified using a ueventd.rc script and a `subsystem` and/or `driver` section.
+There are three options to set for a subsystem or driver: the name, which device name to use,
+and which directory to place the device in. The section takes the below format of
 
     subsystem <subsystem_name>
       devname uevent_devname|uevent_devpath
       [dirname <directory>]
 
-`subsystem_name` is used to match uevent `SUBSYSTEM` value
+`subsystem_name` is used to match the uevent `SUBSYSTEM` value.
 
-`devname` takes one of two options
+`devname` takes one of three options:
   1. `uevent_devname` specifies that the name of the node will be the uevent `DEVNAME`
-  2. `uevent_devpath` specified that the name of the node will be basename uevent `DEVPATH`
+  2. `uevent_devpath` specifies that the name of the node will be basename uevent `DEVPATH`
+  3. `sys_name` specifies that the name of the node will be the contents of `/sys/DEVPATH/name`
 
 `dirname` is an optional parameter that specifies a directory within `/dev` where the node will be
 created.
@@ -71,8 +99,12 @@ For example
     subsystem sound
       devname uevent_devpath
       dirname /dev/snd
-Indicates that all uevents with `SUBSYSTEM=sound` will create nodes as `/dev/snd/<basename uevent
+indicates that all uevents with `SUBSYSTEM=sound` will create nodes as `/dev/snd/<basename uevent
 DEVPATH>`.
+
+The `driver` section has the exact same structure as a `subsystem` section, but
+will instead match the `DRIVER` value in a `bind`/`unbind` uevent. However, the
+`driver` section will be ignored for block devices.
 
 ## /sys
 ----
@@ -123,12 +155,19 @@ not present.
 The exact firmware file to be served can be customized by running an external program by a
 `external_firmware_handler` line in a ueventd.rc file. This line takes the format of
 
-    external_firmware_handler <devpath> <user name to run as> <path to external program>
+    external_firmware_handler <devpath> <user [group]> <path to external program>
+
+The handler will be run as the given user, or if a group is provided, as the given user and group.
+
 For example
 
     external_firmware_handler /devices/leds/red/firmware/coeffs.bin system /vendor/bin/led_coeffs.bin
 Will launch `/vendor/bin/led_coeffs.bin` as the system user instead of serving the default firmware
 for `/devices/leds/red/firmware/coeffs.bin`.
+
+The `devpath` argument may include asterisks (`*`) to match multiple paths. For example, the string
+`/dev/*/red` will match `/dev/leds/red` as well as `/dev/lights/red`. The pattern matching follows
+the rules of the fnmatch() function.
 
 Ueventd will provide the uevent `DEVPATH` and `FIRMWARE` to this external program on the environment
 via environment variables with the same names. Ueventd will use the string written to stdout as the
@@ -139,6 +178,12 @@ directories. If stdout cannot be read, or the program returns with any exit code
 
 Ueventd will additionally log all messages sent to stderr from the external program to the serial
 console after the external program has exited.
+
+If the kernel command-line argument `firmware_class.path` is set, this path
+will be used first by the kernel to search for the firmware files. If found,
+ueventd will not be called at all. See the
+[kernel documentation](https://www.kernel.org/doc/html/v5.10/driver-api/firmware/fw_search_path.html)
+for more details on this feature.
 
 ## Coldboot
 --------
@@ -156,3 +201,13 @@ recommended that devices use genfscon for labeling sysfs nodes. However, some de
 from enabling the parallelization option:
 
     parallel_restorecon enabled
+
+Do parallel restorecon to speed up boot process, subdirectories under `/sys`
+can be sliced by ueventd.rc, and run on multiple process.
+    parallel_restorecon_dir <directory>
+
+For example
+    parallel_restorecon_dir /sys
+    parallel_restorecon_dir /sys/devices
+    parallel_restorecon_dir /sys/devices/platform
+    parallel_restorecon_dir /sys/devices/platform/soc

@@ -44,7 +44,7 @@ cc_binary {
         "libtrusty",
         "libkeymaster_messages",
         "libkeymaster3device",
-        "android.hardware.keymaster@3.0"
+        "android.hardware.keymaster@3.0",
     ],
 }
 
@@ -74,16 +74,84 @@ cc_binary {
         "libtrusty",
         "libkeymaster_messages",
         "libkeymaster4",
-        "android.hardware.keymaster@4.0"
+        "android.hardware.keymaster@4.0",
     ],
 
     vintf_fragments: ["4.0/android.hardware.keymaster@4.0-service.trusty.xml"],
+}
+
+cc_binary {
+    name: "android.hardware.security.keymint-service.trusty",
+    relative_install_path: "hw",
+    init_rc: ["keymint/android.hardware.security.keymint-service.trusty.rc"],
+    vintf_fragments: [
+        "keymint/android.hardware.security.keymint-service.trusty.xml",
+    ],
+    vendor: true,
+    cflags: [
+        "-Wall",
+        "-Wextra",
+    ],
+    local_include_dirs: [
+        "include",
+    ],
+    srcs: [
+        "TrustyKeymaster.cpp",
+        "ipc/trusty_keymaster_ipc.cpp",
+        "keymint/TrustyKeyMintDevice.cpp",
+        "keymint/TrustyKeyMintOperation.cpp",
+        "keymint/TrustyRemotelyProvisionedComponentDevice.cpp",
+        "keymint/TrustySecureClock.cpp",
+        "keymint/TrustySharedSecret.cpp",
+        "keymint/service.cpp",
+    ],
+    shared_libs: [
+        "android.hardware.security.keymint-V4-ndk",
+        "android.hardware.security.rkp-V3-ndk",
+        "android.hardware.security.secureclock-V1-ndk",
+        "android.hardware.security.sharedsecret-V1-ndk",
+        "lib_android_keymaster_keymint_utils",
+        "libbase",
+        "libbinder_ndk",
+        "libhardware",
+        "libkeymaster_messages",
+        "libkeymasterconfig",
+        "liblog",
+        "libtrusty",
+        "libutils",
+    ],
+    required: select(release_flag("RELEASE_AIDL_USE_UNFROZEN"), {
+        true: ["android.hardware.hardware_keystore.xml"],
+        default: ["android.hardware.hardware_keystore_V3.xml"],
+    }),
 }
 
 prebuilt_etc {
     name: "keymaster_soft_attestation_keys.xml",
     vendor: true,
     src: "set_attestation_key/keymaster_soft_attestation_keys.xml",
+}
+
+cc_library {
+    name: "libtrusty_ipc",
+    vendor: true,
+    srcs: ["ipc/trusty_keymaster_ipc.cpp"],
+    local_include_dirs: ["include"],
+    shared_libs: [
+        "libc",
+        "libcrypto",
+        "liblog",
+        "libtrusty",
+        "libhardware",
+        "libkeymaster_messages",
+        "libutils",
+        "libxml2",
+    ],
+    export_include_dirs: ["include"],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
 }
 
 cc_binary {
@@ -104,6 +172,67 @@ cc_binary {
         "libtrusty",
         "libhardware",
         "libkeymaster_messages",
+        "libutils",
+        "libxml2",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}
+
+cc_binary {
+    name: "trusty_keymaster_set_attestation_ids",
+    vendor: true,
+
+    srcs: [
+        "set_attestation_ids/set_attestation_ids.cpp",
+        "ipc/trusty_keymaster_ipc.cpp",
+    ],
+
+    local_include_dirs: ["include"],
+
+    shared_libs: [
+        "libbase",
+        "libc",
+        "libcrypto",
+        "liblog",
+        "libtrusty",
+        "libhardware",
+        "libkeymaster_messages",
+        "libutils",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}
+
+prebuilt_etc {
+    name: "rkp_uds_cert_test.xml",
+    vendor: true,
+    src: "set_uds_certs/rkp_uds_cert_test.xml",
+}
+
+cc_binary {
+    name: "trusty_rkp_set_uds_cert",
+    vendor: true,
+
+    srcs: [
+        "set_uds_certs/set_uds_certificates.cpp",
+        "ipc/trusty_keymaster_ipc.cpp",
+    ],
+
+    local_include_dirs: ["include"],
+
+    shared_libs: [
+        "libc",
+        "libcrypto",
+        "liblog",
+        "libtrusty",
+        "libhardware",
+        "libkeymaster_messages",
+        "libutils",
         "libxml2",
     ],
     cflags: [

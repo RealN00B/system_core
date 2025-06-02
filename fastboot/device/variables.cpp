@@ -17,6 +17,7 @@
 #include "variables.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -26,21 +27,23 @@
 #include <android/hardware/boot/1.1/IBootControl.h>
 #include <ext4_utils/ext4_utils.h>
 #include <fs_mgr.h>
-#include <healthhalutils/HealthHalUtils.h>
 #include <liblp/liblp.h>
 
+#include "BootControlClient.h"
 #include "fastboot_device.h"
 #include "flashing.h"
 #include "utility.h"
 
-using ::android::hardware::boot::V1_0::BoolResult;
-using ::android::hardware::boot::V1_0::Slot;
-using ::android::hardware::boot::V1_1::MergeStatus;
-using ::android::hardware::fastboot::V1_0::FileSystemType;
-using ::android::hardware::fastboot::V1_0::Result;
-using ::android::hardware::fastboot::V1_0::Status;
-using IBootControl1_1 = ::android::hardware::boot::V1_1::IBootControl;
+#ifdef FB_ENABLE_FETCH
+static constexpr bool kEnableFetch = true;
+#else
+static constexpr bool kEnableFetch = false;
+#endif
+
+using MergeStatus = android::hal::BootControlClient::MergeStatus;
+using aidl::android::hardware::fastboot::FileSystemType;
 using namespace android::fs_mgr;
+using namespace std::string_literals;
 
 constexpr char kFastbootProtocolVersion[] = "0.4";
 
@@ -99,38 +102,46 @@ bool GetVariant(FastbootDevice* device, const std::vector<std::string>& /* args 
         *message = "Fastboot HAL not found";
         return false;
     }
+    std::string device_variant = "";
+    auto status = fastboot_hal->getVariant(&device_variant);
 
-    Result ret;
-    auto ret_val = fastboot_hal->getVariant([&](std::string device_variant, Result result) {
-        *message = device_variant;
-        ret = result;
-    });
-    if (!ret_val.isOk() || ret.status != Status::SUCCESS) {
+    if (!status.isOk()) {
         *message = "Unable to get device variant";
+        LOG(ERROR) << message->c_str() << status.getDescription();
         return false;
     }
 
+    *message = device_variant;
     return true;
 }
 
 bool GetBatteryVoltageHelper(FastbootDevice* device, int32_t* battery_voltage) {
-    using android::hardware::health::V2_0::HealthInfo;
-    using android::hardware::health::V2_0::Result;
+    using aidl::android::hardware::health::HealthInfo;
 
     auto health_hal = device->health_hal();
     if (!health_hal) {
         return false;
     }
 
-    Result ret;
-    auto ret_val = health_hal->getHealthInfo([&](Result result, HealthInfo info) {
-        *battery_voltage = info.legacy.batteryVoltage;
-        ret = result;
-    });
-    if (!ret_val.isOk() || (ret != Result::SUCCESS)) {
+    HealthInfo health_info;
+    auto res = health_hal->getHealthInfo(&health_info);
+    if (!res.isOk()) return false;
+    *battery_voltage = health_info.batteryVoltageMillivolts;
+    return true;
+}
+
+bool GetBatterySoCHelper(FastbootDevice* device, int32_t* battery_soc) {
+    using aidl::android::hardware::health::HealthInfo;
+
+    auto health_hal = device->health_hal();
+    if (!health_hal) {
         return false;
     }
 
+    HealthInfo health_info;
+    auto res = health_hal->getHealthInfo(&health_info);
+    if (!res.isOk()) return false;
+    *battery_soc = health_info.batteryLevel;
     return true;
 }
 
@@ -148,17 +159,14 @@ bool GetBatterySoCOk(FastbootDevice* device, const std::vector<std::string>& /* 
         return false;
     }
 
-    Result ret;
-    auto ret_val = fastboot_hal->getBatteryVoltageFlashingThreshold(
-            [&](int32_t voltage_threshold, Result result) {
-                *message = battery_voltage >= voltage_threshold ? "yes" : "no";
-                ret = result;
-            });
-
-    if (!ret_val.isOk() || ret.status != Status::SUCCESS) {
+    auto voltage_threshold = 0;
+    auto status = fastboot_hal->getBatteryVoltageFlashingThreshold(&voltage_threshold);
+    if (!status.isOk()) {
         *message = "Unable to get battery voltage flashing threshold";
+        LOG(ERROR) << message->c_str() << status.getDescription();
         return false;
     }
+    *message = battery_voltage >= voltage_threshold ? "yes" : "no";
 
     return true;
 }
@@ -170,18 +178,14 @@ bool GetOffModeChargeState(FastbootDevice* device, const std::vector<std::string
         *message = "Fastboot HAL not found";
         return false;
     }
-
-    Result ret;
-    auto ret_val =
-            fastboot_hal->getOffModeChargeState([&](bool off_mode_charging_state, Result result) {
-                *message = off_mode_charging_state ? "1" : "0";
-                ret = result;
-            });
-    if (!ret_val.isOk() || (ret.status != Status::SUCCESS)) {
+    bool off_mode_charging_state = false;
+    auto status = fastboot_hal->getOffModeChargeState(&off_mode_charging_state);
+    if (!status.isOk()) {
         *message = "Unable to get off mode charge state";
+        LOG(ERROR) << message->c_str() << status.getDescription();
         return false;
     }
-
+    *message = off_mode_charging_state ? "1" : "0";
     return true;
 }
 
@@ -193,6 +197,17 @@ bool GetBatteryVoltage(FastbootDevice* device, const std::vector<std::string>& /
         return true;
     }
     *message = "Unable to get battery voltage";
+    return false;
+}
+
+bool GetBatterySoC(FastbootDevice* device, const std::vector<std::string>& /* args */,
+                   std::string* message) {
+    int32_t battery_soc = 0;
+    if (GetBatterySoCHelper(device, &battery_soc)) {
+        *message = std::to_string(battery_soc);
+        return true;
+    }
+    *message = "Unable to get battery soc";
     return false;
 }
 
@@ -209,7 +224,7 @@ bool GetSlotCount(FastbootDevice* device, const std::vector<std::string>& /* arg
     if (!boot_control_hal) {
         *message = "0";
     } else {
-        *message = std::to_string(boot_control_hal->getNumberSlots());
+        *message = std::to_string(boot_control_hal->GetNumSlots());
     }
     return true;
 }
@@ -220,7 +235,7 @@ bool GetSlotSuccessful(FastbootDevice* device, const std::vector<std::string>& a
         *message = "Missing argument";
         return false;
     }
-    Slot slot;
+    int32_t slot = -1;
     if (!GetSlotNumber(args[0], &slot)) {
         *message = "Invalid slot";
         return false;
@@ -230,7 +245,7 @@ bool GetSlotSuccessful(FastbootDevice* device, const std::vector<std::string>& a
         *message = "Device has no slots";
         return false;
     }
-    if (boot_control_hal->isSlotMarkedSuccessful(slot) != BoolResult::TRUE) {
+    if (boot_control_hal->IsSlotMarkedSuccessful(slot).value_or(false)) {
         *message = "no";
     } else {
         *message = "yes";
@@ -244,7 +259,7 @@ bool GetSlotUnbootable(FastbootDevice* device, const std::vector<std::string>& a
         *message = "Missing argument";
         return false;
     }
-    Slot slot;
+    int32_t slot = -1;
     if (!GetSlotNumber(args[0], &slot)) {
         *message = "Invalid slot";
         return false;
@@ -254,7 +269,7 @@ bool GetSlotUnbootable(FastbootDevice* device, const std::vector<std::string>& a
         *message = "Device has no slots";
         return false;
     }
-    if (boot_control_hal->isSlotBootable(slot) != BoolResult::TRUE) {
+    if (!boot_control_hal->IsSlotBootable(slot).value_or(false)) {
         *message = "yes";
     } else {
         *message = "no";
@@ -333,19 +348,16 @@ bool GetPartitionType(FastbootDevice* device, const std::vector<std::string>& ar
 
     auto fastboot_hal = device->fastboot_hal();
     if (!fastboot_hal) {
-        *message = "Fastboot HAL not found";
-        return false;
+        *message = "raw";
+        return true;
     }
 
     FileSystemType type;
-    Result ret;
-    auto ret_val =
-            fastboot_hal->getPartitionType(args[0], [&](FileSystemType fs_type, Result result) {
-                type = fs_type;
-                ret = result;
-            });
-    if (!ret_val.isOk() || (ret.status != Status::SUCCESS)) {
+    auto status = fastboot_hal->getPartitionType(args[0], &type);
+
+    if (!status.isOk()) {
         *message = "Unable to retrieve partition type";
+        LOG(ERROR) << message->c_str() << status.getDescription();
     } else {
         switch (type) {
             case FileSystemType::RAW:
@@ -390,6 +402,12 @@ bool GetPartitionIsLogical(FastbootDevice* device, const std::vector<std::string
 bool GetIsUserspace(FastbootDevice* /* device */, const std::vector<std::string>& /* args */,
                     std::string* message) {
     *message = "yes";
+    return true;
+}
+
+bool GetIsForceDebuggable(FastbootDevice* /* device */, const std::vector<std::string>& /* args */,
+                          std::string* message) {
+    *message = android::base::GetBoolProperty("ro.force.debuggable", false) ? "yes" : "no";
     return true;
 }
 
@@ -507,5 +525,124 @@ bool GetSecurityPatchLevel(FastbootDevice* /* device */, const std::vector<std::
 bool GetTrebleEnabled(FastbootDevice* /* device */, const std::vector<std::string>& /* args */,
                       std::string* message) {
     *message = android::base::GetProperty("ro.treble.enabled", "");
+    return true;
+}
+
+bool GetMaxFetchSize(FastbootDevice* /* device */, const std::vector<std::string>& /* args */,
+                     std::string* message) {
+    if (!kEnableFetch) {
+        *message = "fetch not supported on user builds";
+        return false;
+    }
+    *message = android::base::StringPrintf("0x%X", kMaxFetchSizeDefault);
+    return true;
+}
+
+bool GetDmesg(FastbootDevice* device) {
+    if (GetDeviceLockStatus()) {
+        return device->WriteFail("Cannot use when device flashing is locked");
+    }
+
+    std::unique_ptr<FILE, decltype(&::fclose)> fp(popen("/system/bin/dmesg", "re"), ::fclose);
+    if (!fp) {
+        PLOG(ERROR) << "popen /system/bin/dmesg";
+        return device->WriteFail("Unable to run dmesg: "s + strerror(errno));
+    }
+
+    ssize_t rv;
+    size_t n = 0;
+    char* str = nullptr;
+    while ((rv = ::getline(&str, &n, fp.get())) > 0) {
+        if (str[rv - 1] == '\n') {
+            rv--;
+        }
+        device->WriteInfo(std::string(str, rv));
+    }
+
+    int saved_errno = errno;
+    ::free(str);
+
+    if (rv < 0 && saved_errno) {
+        LOG(ERROR) << "dmesg getline: " << strerror(saved_errno);
+        device->WriteFail("Unable to read dmesg: "s + strerror(saved_errno));
+        return false;
+    }
+
+    return true;
+}
+
+bool GetBatterySerialNumber(FastbootDevice* device, const std::vector<std::string>&,
+                            std::string* message) {
+    auto health_hal = device->health_hal();
+    if (!health_hal) {
+        return false;
+    }
+
+    if (GetDeviceLockStatus()) {
+        return device->WriteFail("Device is locked");
+    }
+
+    *message = "unsupported";
+
+    int32_t version = 0;
+    auto res = health_hal->getInterfaceVersion(&version);
+    if (!res.isOk()) {
+        return device->WriteFail("Unable to query battery data");
+    }
+    if (version >= 3) {
+        using aidl::android::hardware::health::BatteryHealthData;
+
+        BatteryHealthData data;
+        auto res = health_hal->getBatteryHealthData(&data);
+        if (!res.isOk()) {
+            return device->WriteFail("Unable to query battery data");
+        }
+        if (data.batterySerialNumber) {
+            *message = *data.batterySerialNumber;
+        }
+    }
+    return true;
+}
+
+bool GetBatteryPartStatus(FastbootDevice* device, const std::vector<std::string>&,
+                          std::string* message) {
+    auto health_hal = device->health_hal();
+    if (!health_hal) {
+        return false;
+    }
+
+    using aidl::android::hardware::health::BatteryPartStatus;
+
+    BatteryPartStatus status = BatteryPartStatus::UNSUPPORTED;
+
+    int32_t version = 0;
+    auto res = health_hal->getInterfaceVersion(&version);
+    if (!res.isOk()) {
+        return device->WriteFail("Unable to query battery data");
+    }
+    if (version >= 3) {
+        using aidl::android::hardware::health::BatteryHealthData;
+
+        BatteryHealthData data;
+        auto res = health_hal->getBatteryHealthData(&data);
+        if (!res.isOk()) {
+            return device->WriteFail("Unable to query battery data");
+        }
+        status = data.batteryPartStatus;
+    }
+    switch (status) {
+        case BatteryPartStatus::UNSUPPORTED:
+            *message = "unsupported";
+            break;
+        case BatteryPartStatus::ORIGINAL:
+            *message = "original";
+            break;
+        case BatteryPartStatus::REPLACED:
+            *message = "replaced";
+            break;
+        default:
+            *message = "unknown";
+            break;
+    }
     return true;
 }

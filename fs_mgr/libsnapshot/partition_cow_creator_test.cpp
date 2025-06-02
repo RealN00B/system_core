@@ -39,6 +39,7 @@ using ::testing::Truly;
 namespace android {
 namespace snapshot {
 
+// @VsrTest = 3.7.6
 class PartitionCowCreatorTest : public ::testing::Test {
   public:
     void SetUp() override {
@@ -249,8 +250,8 @@ TEST_F(PartitionCowCreatorTest, CompressionEnabled) {
                                 .target_partition = system_b,
                                 .current_metadata = builder_a.get(),
                                 .current_suffix = "_a",
-                                .compression_enabled = true,
-                                .update = &update};
+                                .update = &update,
+                                .using_snapuserd = true};
 
     auto ret = creator.Run();
     ASSERT_TRUE(ret.has_value());
@@ -275,8 +276,8 @@ TEST_F(PartitionCowCreatorTest, CompressionWithNoManifest) {
                                 .target_partition = system_b,
                                 .current_metadata = builder_a.get(),
                                 .current_suffix = "_a",
-                                .compression_enabled = true,
-                                .update = nullptr};
+                                .update = nullptr,
+                                .using_snapuserd = true};
 
     auto ret = creator.Run();
     ASSERT_FALSE(ret.has_value());
@@ -308,6 +309,10 @@ TEST(DmSnapshotInternals, CowSizeCalculator) {
         cc.WriteByte(b);
         ASSERT_EQ(cc.cow_size_sectors(), 40);
     }
+
+    // Write a byte that would surely overflow the counter
+    cc.WriteChunk(std::numeric_limits<uint64_t>::max());
+    ASSERT_FALSE(cc.cow_size_sectors().has_value());
 }
 
 void BlocksToExtents(const std::vector<uint64_t>& blocks,
